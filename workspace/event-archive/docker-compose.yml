@@ -1,0 +1,35 @@
+services:
+  archive:
+    build: .
+    image: event-archive:1.0
+    container_name: event-archive
+    ports:
+      - "8080:8080"
+    environment:
+      EA_DATA_DIR: /data
+      EA_PORT: "8080"
+      EA_WINDOW_MS: "3600000"
+      EA_ROTATE_COUNT: "100000"
+      EA_LATE_GRACE_MS: "300000"
+      EA_FLUSH_INTERVAL: "0.5"
+    volumes:
+      - archive-data:/data
+    restart: unless-stopped
+
+  # 一键端到端验证（docker compose --profile test run --rm e2e）
+  e2e:
+    profiles: ["test"]
+    image: event-archive:1.0
+    depends_on:
+      - archive
+    network_mode: "service:archive"
+    environment:
+      EA_BASE_URL: http://127.0.0.1:8080
+      EA_DATA_DIR: /data
+    volumes:
+      - archive-data:/data
+      - ./tests:/srv/tests:ro
+    entrypoint: ["python", "/srv/tests/e2e.py"]
+
+volumes:
+  archive-data:
