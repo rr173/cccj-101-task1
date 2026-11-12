@@ -23,6 +23,20 @@ archive/store.py         归档登记（archive_batches / archive_shards /
                          archive_pages），含冻结快照、幂等登记与清理
 archive/archiver.py      写文件→从盘校验→登记→清理正文的发布编排与崩溃恢复
 archive/inspect.py       只读预览、按租户/日期列出分片、整份与逐页核验
+search/tokenizer.py      NFKC+casefold 确定性切词，区间映射回未经规范化的原文
+search/parser.py         布尔表达式解析器：字段/括号/短语/AND/OR/NOT，
+                         语法错误带字符位置，绝不拼 SQL、绝不回退文本搜索
+search/store.py          独立检索库（search_ 前缀表）：词典、带位置/区间的
+                         倒排表、文档、水位、消费账本、跳过原因
+search/indexer.py        增量索引器：rowid 水位追平、账本识别迟到/改写、
+                         单事务原子落定、撤回/恢复、硬退出屏障
+search/engine.py         AST 在完整命中文档集合上做集合运算、快照读、
+                         相关性/编号排序、分页与原文半开区间高亮
+search/naive.py          朴素逐篇参考解释器，验收时与倒排引擎逐篇对照
+run_search.py            独立检索入口（CLI）：index/update/rebuild/query/
+                         status/explain
+tests/search_acceptance.py
+                         本地检索验收断言（11 组场景，含真实 SIGKILL，全离线）
 run_fetch.py             可配置抓取入口（CLI），输出每租户已确认区间与版本计数
 run_quality.py           独立质量处理入口（CLI）：process/status/trace/
                          publish/discard-staging/generations/rules-check
@@ -416,4 +430,178 @@ python3 run_archive.py archive --db out/harvest.db \
 
 ```bash
 python3 tests/archive_acceptance.py   # 退出码 0 表示全通过
+```
+
+# 本地布尔检索层（local search）
+
+采集器只负责落地，质量层负责合规口径，**检索层只回答“哪些成果的标题/摘要
+同时提到了哪些实验条件”**。它是完全离线的独立模块：
+
+- 检索数据来自落地库 `result_versions` 的 `title` 与 `abstract`（取自 payload
+  JSON），**检索库是独立 SQLite 文件**，落地库以只读方式打开，检索层不改任何
+  采集表、不联网、不接入抓取线程；建索引/跟进更新只在显式命令里运行。
+- 表达式**绝不拼接成 SQL**：查询先解析成语法树，SQL 只做词典精确查找和倒排行
+  读取，命中集合在 Python 里按语法树做并/交/差；解析失败直接报带位置的语法错，
+  **不会**退化成普通文本搜索。
+
+## 查询语法（规则即契约）
+
+```
+or_expr  := and_expr (OR and_expr)*
+and_expr := factor ((AND? factor) | (AND? NOT factor))*
+factor   := primary (NOT primary)*
+primary  := '(' or_expr ')' | leaf
+leaf     := [字段 ':'] ( 短语 | 词 )
+短语     := '"' ... '"'          # 引号必须闭合
+字段     := title | abstract     # 其他字段名是未知字段错误
+```
+
+- **运算符**：`AND`/`OR`/`NOT` 仅识别大写 ASCII 关键字。相邻检索项不写运算符
+  时按 **默认 AND** 处理（如 `title:x title:y`）。
+- **NOT 只作二元差集**：`A NOT B` 与 `A AND NOT B` 等价，都是集合 `A − B`；
+  前导 `NOT`、`OR NOT` 没有左操作数，报语法错。
+- **字段**：只允许 `title`、`abstract`；不带字段的词项同时检索两个字段。
+  字段限定与否定表达式都在查询入口给定的机构（tenant）内求值，不会带进其他
+  机构的文档。
+- **短语**：双引号内的内容经同一套规范化/切词后，要求这些词项在**同一字段内
+  占据连续词位**。短语不可能从标题末尾跨到摘要开头（两个字段分别编号词位）。
+- **未加引号的多词项词**（如汉字 `蛋白`）切出多个词项，按隐式 AND 处理；只有
+  加引号才要求连续词位。
+- **必报的语法错误（带 0 起算字符位置和 `^` 指示）**：未知字段、空括号 `()`、
+  空短语 `""`、残缺运算符（`a AND`、`a OR`、`a NOT`、`AND a`、`a AND OR b`）、
+  前导/`OR` 后的 NOT、未闭合引号、未闭合括号、多余右括号、裸冒号。
+  退出码 3，且不产生任何检索结果。
+
+## 切词与原文区间约定（确定性）
+
+每个字段独立编号词位，顺序固定：
+
+1. 先做 **Unicode NFKC**，再做 **`str.casefold()`**；
+2. 连续拉丁字母或十进制数字组成一个词；**每个汉字（CJK 表意文字）单独占一个
+   词位**；标点与空白只起分隔作用，**不占词位**；其他文字/符号同样只分隔。
+3. 返回的命中区间是**半开 `[start, end)` 字符区间，按未经规范化原文的 Unicode
+   字符计数**，`text[start:end]` 切回原文。规范化长度变化也不标错：
+   - 全角 `ＡＢＣ` → 词 `abc`，区间仍是原文 3 个全角字符；
+   - 连字 `ﬁle`（ﬁ 是单字符）→ 词 `file`，区间覆盖原文 3 个字符；
+   - `Straße` casefold 成 `strasse`（ß 展开为两个字符），区间仍按 6 个源字符；
+   - 组合字符（如 `e` + U+0301）在 NFKC 下被合成，区间按合并前的源字符计数。
+
+实现先逐源字符做 NFKC 并保留其源区间，再处理跨字符的规范合成，最后对每个
+对齐片做 casefold；词的区间是其所有片源区间的并集。
+
+## 排序、评分与分页
+
+- **相关性（默认 `order=relevance`）**：得分 = 该文档命中的**不同查询叶节点
+  数**（同一个叶在文中出现多次不重复加分；NOT 右支、OR 未命中的分支不加分也不
+  产生高亮）。同分按 `(tenant, accession)` 字典序，排序完全确定。
+- **按成果编号核对（`order=accession`）**：直接按 `(tenant, accession)` 排序。
+- `total` 是**完整匹配集合**的大小，与分页无关；`offset/limit` 在排序后的完整
+  集合上切片，页之间无缺口、无重复。
+- 一次查询在一个 WAL 读快照事务内完成（进入事务立即用一次读固定快照），因此
+  查询内的 total、排序、摘录来自同一代索引；查询进行中索引更新提交也不影响
+  本次结果。
+- 每个返回项带原文摘录（`【…】` 标注高亮）与 `title_spans`/`abstract_spans`
+  两组半开区间；否定分支的词不高亮，OR 未命中分支不制造区间。
+
+## 文档身份、增量与生命周期
+
+- 身份沿用采集库的 `(tenant, accession, revision)`。**每个机构同一成果只展示
+  最新修订**：索引里 `(tenant, accession)` 唯一，仅存当前修订的原文与倒排行。
+- 消费进度：每机构 `search_cursor` 记录已消费到的 `result_versions.rowid`
+  水位；另有 `search_ledger` 记录每个身份的内容哈希。首次建索引全量扫描，之后
+  `update` 只读 `rowid > 水位` 的新行，**不会每次全文重扫源表**。采集落地是只
+  追加的（仅 `INSERT OR IGNORE`，rowid 单调），因此迟到版本的 rowid 也高于水位、
+  必被增量读到；账本让重传的相同身份幂等吸收。若有人在库外原地改写旧行，可用
+  显式 `rebuild` 整体对账。
+- 新版本：在**同一事务**内删旧倒排、写新倒排、换当前修订原文，并把水位推进到
+  本提交分块已处理的最大 rowid，因此不会出现“搜到旧词却显示新摘要”。迟到的
+  较小修订永远不覆盖当前文本。
+- 撤回（最新修订 `retracted=1`）：文档从检索中删除（结果里消失）；之后更高的
+  非撤回修订到达时重新写入、恢复可搜。
+- **空摘要**：不产生摘要倒排，但标题照常可检索，并在返回里标注“空摘要”。
+- **非文本字段**：对象、数组、数字等绝不 `str()` 成字符串混入索引；该字段跳过，
+  原因写入 `search_skips` 并随文档行的 `title_skip`/`abstract_skip` 返回。
+- **原子落定与续跑**：数据按固定分块（默认每块 500 个成果）提交，每个分块的
+  词位、原文、当前修订与该块水位在一个事务里落定。进程在事务提交前被硬退出
+  （验收用真实 SIGKILL/`os._exit`）时整个事务回滚，读者仍看到上一完整代，
+  水位停在前一分块；再次 `update` 从持久水位接续，账本保证重放幂等，未处理的
+  后续分块不会被跳过。
+
+## 命令
+
+```bash
+cd research_harvester
+
+# 首次建立索引（全量扫描落地库；落地库只读打开）
+python3 run_search.py index --db out/harvest.db --index out/search.db
+
+# 追平后来写入的资料（增量，只读新 rowid；可限定机构）
+python3 run_search.py update --db out/harvest.db --index out/search.db \
+    --tenants alpha,beta
+
+# 显式丢弃并整体重建（需要时才全量重扫）
+python3 run_search.py rebuild --db out/harvest.db --index out/search.db
+
+# 查询：--tenant 是必填的机构入口；表达式作为一个参数传入
+python3 run_search.py query --index out/search.db --tenant alpha \
+    'title:光谱 AND (abstract:"mass spectrometry" OR abstract:蛋白)' \
+    --order relevance --limit 10 --offset 0
+python3 run_search.py query --index out/search.db --tenant alpha \
+    'abstract:mass NOT abstract:balance' --order accession --json
+
+# 查看语法树与规范化后的叶词项（不访问索引）
+python3 run_search.py explain 'title:光谱 AND abstract:"mass spectrometry"'
+
+# 索引元数据、每机构水位、文档/词项/跳过计数
+python3 run_search.py status --index out/search.db --json
+```
+
+查询退出码：`0` 成功（含 total=0）；`2` 入口参数错误；`3` 表达式语法错误。
+JSON 输出包含 `total/offset/limit/order/results`，每个结果含原文、半开区间
+（`title_spans`、`abstract_spans`）、摘录与跳过原因。
+
+## 检索库表（全部 `search_` 前缀，独立文件，增量创建）
+
+| 表 | 用途 |
+|---|---|
+| `search_meta` | schema 版本、上次同步时间 |
+| `search_cursor` | 每机构 rowid 水位（读取位置） |
+| `search_ledger` | 已消费身份 `(tenant,accession,revision)` + 内容哈希，识别迟到/改写 |
+| `search_docs` | 每 `(tenant,accession)` 当前修订的原文、词数、撤回态、跳过原因 |
+| `search_terms` | 规范化词项词典 |
+| `search_postings` | 词项→文档→字段：词位 positions 与原文半开区间 spans、tf |
+| `search_skips` | 非文本/缺字段的跳过审计（字段、类型、原因） |
+
+连接以 `isolation_level=None` 显式管理 `BEGIN/COMMIT`，并开启 WAL；只读落地
+连接带 `mode=ro` 与 `query_only`。
+
+## 验收场景（tests/search_acceptance.py）
+
+样本固定覆盖：跨字段假短语、全角/连字/casefold/组合字符等不同规范化长度原文、
+只命中 OR 一侧的论文、空摘要、非文本字段；再经历改摘要、迟到旧修订、撤回与
+恢复，并在索引写事务中真实 SIGKILL 后接续。引擎结果与 `search/naive.py`
+朴素解释器逐篇对照（集合、得分、高亮区间、排序、total、分页），不盲信倒排引擎。
+
+| 场景 | 断言 |
+|---|---|
+| S1 | 合法语法全接受；未知字段/空括号/空短语/残缺运算符/未闭合引号等均带位置报错；引擎不回退文本搜索 |
+| S2 | 全角、连字展开、casefold 变长、组合字符合并下，半开区间仍对应未经规范化原文 |
+| S3 | 复杂表达式真实命中与高亮，区间切回原文字符 |
+| S4 | 跨字段假短语不命中；字段限定 AND 仍可独立命中 |
+| S5 | OR 单侧命中不制造另一侧高亮；NOT 右支不高亮；差集语义正确 |
+| S6 | 非文本字段给原因、不字符串化；空摘要可按标题检索 |
+| S7 | 引擎与朴素解释器在全部表达式、两种排序、分页下集合/得分/区间/total 全一致 |
+| S8 | 改摘要移除旧词；迟到低修订不覆盖；撤回消失；高修订恢复；追平后零行重扫 |
+| S9 | 写事务内真实 SIGKILL：水位不前移、无部分文档、旧词配旧文；接续后收敛到新修订 |
+| S10 | 机构为必填且不串机构；字段限定与否定不带来其他机构文档 |
+| S11 | 一次查询固定单一代快照，并发提交不改变本次 total/排序/摘录 |
+| S12 | 多分块提交时在第二个分块事务内真实硬退出：仅首个分块可见、水位不跳过未处理行；接续后无丢失无重复，水位到达真实最大 rowid |
+| 边界 | 重复词短语（`"long long"`）不塌缩；标点不占词位、短语可跨标点；空集 total=0 |
+
+```bash
+python3 tests/search_acceptance.py   # 退出码 0 表示全通过（343 项断言）
+python3 tests/acceptance.py          # 原采集器验收，保持兼容
+python3 tests/quality_acceptance.py
+python3 tests/crash_consistency_acceptance.py
+python3 tests/archive_acceptance.py
 ```
