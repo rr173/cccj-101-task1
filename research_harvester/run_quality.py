@@ -99,7 +99,14 @@ def cmd_status(args):
 def cmd_trace(args):
     conn = _connect(args.db)
     store.require_landing(conn)
-    report = _trace(conn, args.tenant, args.accession)
+    try:
+        report = _trace(conn, args.tenant, args.accession)
+    except store.VerificationError as exc:
+        # an archived page whose shard cannot be verified is an integrity
+        # error, not a "no trace" answer -- never report success
+        print(f"trace failed: {exc}", file=sys.stderr)
+        conn.close()
+        return 4
     conn.close()
     if not report["inputs"] and not report["events"] and not report["current"]:
         print(f"no trace found for {args.tenant}/{args.accession}",
@@ -282,15 +289,45 @@ def _trace(conn, tenant, accession):
     raw_ids = sorted({r["raw_page_id"] for r in inputs
                       if r.get("raw_page_id") is not None})
     raw_pages = []
-    for raw_id in raw_ids:
-        row = conn.execute("SELECT id, tenant, status, url, fetched_at,"
-                           " scan_until FROM raw_pages WHERE id=?",
-                           (raw_id,)).fetchone()
-        if row:
-            raw_pages.append(dict(row))
+    body_sources = {}
+    if raw_ids:
+        placeholders = ",".join("?" for _ in raw_ids)
+        for row in conn.execute(
+                f"SELECT id, tenant, status, url, fetched_at, scan_until,"
+                f" body FROM raw_pages WHERE id IN ({placeholders})"
+                f" ORDER BY id", raw_ids):
+            page = dict(row)
+            body, source = _page_body(conn, page)
+            body_sources[str(page["id"])] = source
+            if body is not None:
+                page["body"] = body
+            raw_pages.append(page)
+    # raw_pages are already in ascending id order -- the original landing
+    # order of the response pages -- whether a body is still online or has
+    # been moved to a shard.
     return {"tenant": tenant, "accession": accession, "inputs": inputs,
-            "events": events, "current": current, "raw_pages": raw_pages}
+            "events": events, "current": current, "raw_pages": raw_pages,
+            "body_sources": body_sources}
 
+
+def _page_body(conn, page):
+    """Body for a raw page, reading the shard when SQLite no longer has it."""
+    if page.get("body") is not None:
+        return page["body"], "sqlite"
+    try:
+        from archive import archiver as archive_archiver
+    except ImportError:
+        return None, "missing"
+    owner = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='archive_pages'").fetchone()
+    if not owner:
+        return None, "missing"
+    try:
+        return archive_archiver.load_page_body(conn, page["id"])
+    except Exception as exc:  # corrupt/unreadable shard: never guess
+        raise store.VerificationError(
+            f"cannot read archived page {page['id']}: {exc}")
 
 def _payload(conn, tenant, accession, revision):
     row = conn.execute(
@@ -347,8 +384,13 @@ def _format_trace(report):
     if report["raw_pages"]:
         lines.append("source raw pages:")
         for page in report["raw_pages"]:
+            source = report.get("body_sources", {}).get(str(page["id"]),
+                                                        "sqlite")
             lines.append(f"  raw_page_id={page['id']} status={page['status']}"
-                         f" url={page['url']}")
+                         f" url={page['url']} body_source={source}")
+            body = page.get("body")
+            if body is not None:
+                lines.append(f"    body={body}")
     return "\n".join(lines)
 
 

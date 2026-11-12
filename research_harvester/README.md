@@ -17,14 +17,23 @@ quality/rules/v1.json    规则文件（明确 rule_version，可另存新版本
 quality/store.py         质量投影存储：代次、原子发布指针、读者视图、审计表
 quality/processor.py     质量隔离处理器：增量识别、逐租户重建、冲突解析、
                          代次准备→核对→原子切换
+archive/shard.py         压缩 JSONL 分片格式：manifest 头、逐页记录、footer，
+                         整份与单页 SHA256，原子写入 + 旁车 manifest
+archive/store.py         归档登记（archive_batches / archive_shards /
+                         archive_pages），含冻结快照、幂等登记与清理
+archive/archiver.py      写文件→从盘校验→登记→清理正文的发布编排与崩溃恢复
+archive/inspect.py       只读预览、按租户/日期列出分片、整份与逐页核验
 run_fetch.py             可配置抓取入口（CLI），输出每租户已确认区间与版本计数
 run_quality.py           独立质量处理入口（CLI）：process/status/trace/
                          publish/discard-staging/generations/rules-check
+run_archive.py           独立归档入口（CLI）：archive/preview/list/verify/batches
 tests/acceptance.py      采集器验收断言（8 个场景，全部离线）
 tests/quality_acceptance.py  质量隔离层验收断言（16 个场景，全部离线）
 tests/crash_consistency_acceptance.py
                          发布资格/崩溃一致性验收（6 个场景，真实 SIGKILL
                          子进程故障 + 旧库迁移，全部离线）
+tests/archive_acceptance.py  原始响应保留/归档验收断言（12 个场景，全部离线，
+                         含两处真实 SIGKILL 中断与重跑收敛）
 ```
 
 ## 离线运行命令
@@ -43,6 +52,8 @@ python3 run_fetch.py --server http://127.0.0.1:8734 \
 # 3) 验收断言（自带服务，无需先启动 1）
 python3 tests/acceptance.py
 python3 tests/quality_acceptance.py
+python3 tests/crash_consistency_acceptance.py
+python3 tests/archive_acceptance.py
 ```
 
 `run_fetch.py` 结束时打印每个租户的已确认区间 `[origin, high_watermark]`、
@@ -283,3 +294,126 @@ SIGKILL**，因此复现的是已提交事务的持久状态，而非可回滚�
 | C4 | 零事件批次（重评后判定全不变）凭显式标记正常发布，不被误拦；后续无变化仍为 no-op |
 | C5 | 旧库三种 staging 形态（仅汇总/半个租户/看似齐全）均拒绝发布、由 resume 重建；已发布旧代次保持原样 |
 | C6 | 回归：年份质量判定与 DOI 双向冲突/自动解除在崩溃恢复后仍然正确，履历完整 |
+
+# 原始响应保留与归档（retention / archive）
+
+采集器把每次 HTTP 回包（200 页与错误响应）原样留在 `raw_pages`。本层是把
+**过期正文**移出主库的独立能力：`raw_pages` 行（页号、状态码、URL、抓取时间、
+`scan_until`）与 `result_versions.raw_page_id` **一律保留**，正文改写为 `NULL`
+后改从压缩分片读取。范围仅限原始响应的保留与追溯，不新增质量判断、报表或界面。
+
+## 快照与截止边界
+
+- 每轮归档在**启动时**固定两个值：UTC 截止时间 `cutoff_at` 与当前最大页序号
+  `max_page_id`，并写入 `archive_batches`。之后到达的回包（即便回填到过去时间）
+  页号超出上限，不属于本轮。
+- 截止是**闭区间**：`fetched_at <= cutoff_at` 视为到期。恰好等于截止时刻的
+  记录会被归档（有独立断言固定该语义）。
+- `--retention-days N`（默认 30）等价于 `cutoff_at = now - N*86400`；
+  `--cutoff-at <ts>` 可直接指定。日期分片桶按 **UTC** 日历日
+  `YYYY-MM-DD` 划分（`time.gmtime`），与本地时区无关。
+- 同一 `cutoff_at` + 租户/日期筛选若存在**未完成**批次，重跑会复用该批次
+  已冻结的 `max_page_id`，不会围绕新行重新冻结；`cleared` 终态批次不再复用，
+  下一次即新快照。
+
+## 分片格式与布局
+
+路径 `<archive-dir>/<tenant>/<UTC-date>/part-<shard_no>-<snapshot_sig>-<first>-<last>.jsonl.gz`：
+
+- 文件名内嵌冻结快照签名与页号范围：**相同输入快照**总映射到同一路径，
+  **另一份快照**永远落到不同路径，不会被旧文件覆盖。
+- 文件为 gzip 文本，逐行一个 JSON 对象：首行 manifest、随后按页号升序的页记录、
+  末行 footer。manifest 记录租户、UTC 日期、分片序号、`cutoff_at`、
+  `max_page_id`、页数、起止页号、每页原文 SHA256 映射与正文摘要；页记录保存
+  完整原文 `body` 及其 `body_sha256`；footer 重复摘要与页数以防截断。
+- 旁车 `*.manifest.json` 记录整份文件 SHA256 与压缩字节数。
+- 整份摘要按“页行按 `\n` 连接 + 末尾换行”的 UTF-8 文本计算，可用
+  `gunzip | sha256sum` 之外的自带算法离线复算（验收 A12 用标准库独立复算）。
+
+## 跨资源发布：可中断、可重试
+
+文件与 SQLite 无法放进一个事务，因此发布拆成幂等阶段，批次 `phase` 记录位置：
+
+| 阶段 | 含义 | 重跑行为 |
+|---|---|---|
+| `planned` | 快照已冻结，尚未写文件 | 正常写入 |
+| `shard_written` | 文件已落盘，登记未完成（**崩溃窗口 1**） | 用同一路径重新渲染→发现文件已在→从盘校验→**收养**并登记，不丢数据、不重复 |
+| `registered` | 分片已登记，正文可能未清（**崩溃窗口 2**） | 不重写、不重复登记，直接清理正文 |
+| `cleared` | 已登记且正文已清 | 幂等 no-op |
+| `failed` | 有分片未通过校验，该租户未登记、正文保留 | 可再次运行同一快照收敛 |
+
+- 写入用临时文件 + `fsync` + `link`（目标已存在则失败），永不覆盖。
+- **只有从磁盘重新计算整份与单页摘要均通过的分片才会被登记或读取。**
+- 登记与正文清理是独立事务；清理按 `archive_pages` 归属逐页执行，因此
+  “登记后再崩溃”也能在下一次运行收敛，且不会碰到批次之外的新行。
+- 若已有分片内容与校验值不符：**停止并给出定位**（租户、路径、页号），
+  不覆盖文件、不清空原正文、不报告成功；该租户其余步骤跳过，
+  **其他尚未开始的租户继续归档**（租户隔离）。
+
+## 追踪行为
+
+`run_quality.py trace` 读取页正文时：SQLite 有正文则取自 `sqlite`；正文已移出
+则按 `archive_pages` 找到分片、校验后取回，来源标为 `archive`。`raw_pages`
+仍按原页号升序返回，**混合状态**（部分已归档、部分在线）的来源顺序与原始内容
+保持一致。分片损坏时 trace 以退出码 4 报错，不回退成“查无记录”，也不猜测。
+
+## 命令
+
+```bash
+cd research_harvester
+
+# 只读预览：各租户可释放正文容量与分片数量，不写文件、不清正文
+python3 run_archive.py preview --db out/harvest.db --retention-days 30
+
+# 归档到期正文（按机构、抓取日期、页序分片）；--no-clear 只登记不清正文
+python3 run_archive.py archive --db out/harvest.db \
+    --archive-dir out/archive --retention-days 30
+python3 run_archive.py archive --db out/harvest.db \
+    --archive-dir out/archive --cutoff-at 1700000000 \
+    --tenants alpha,beta --fetch-date 2026-01-01 --page-group-limit 200
+
+# 按机构/日期找分片文件
+python3 run_archive.py list --db out/harvest.db \
+    --tenant alpha --fetch-date 2026-01-01
+
+# 完整性核验：重新计算整份与单页摘要，报告在线/已迁出/校验问题页数
+python3 run_archive.py verify --db out/harvest.db --tenant alpha
+
+# 批次编号与当前阶段（供值班决定重跑或停止）
+python3 run_archive.py batches --db out/harvest.db
+python3 run_archive.py archive --db out/harvest.db \
+    --archive-dir out/archive --resume-batch b17000-1234-abcd
+```
+
+所有命令均为标准库、完全离线可重复；`preview`/`list`/`verify`/`batches` 不
+创建表、不写行、不触碰抓取游标 `scan_state`、水位 `watermarks`、质量投影、
+规则代次或处理进度。
+
+## 新增表（均以 `archive_` 前缀，增量创建）
+
+| 表 | 用途 |
+|---|---|
+| `archive_batches` | 批次编号、冻结的 `cutoff_at`/`max_page_id`、筛选、当前 `phase` |
+| `archive_shards` | 每个分片的路径、整份 SHA256、压缩字节数、页数、起止页号、摘要 |
+| `archive_pages` | 页号 → 所属分片的归属、单页摘要、清理时间 |
+
+## 归档验收场景（tests/archive_acceptance.py）
+
+| 场景 | 断言 |
+|---|---|
+| A1 | 归档后 `trace` 读回与归档前逐字节一致的回包；状态码/URL/抓取时间/页号/版本引用仍可查 |
+| A2 | 截止闭区间边界；启动后写入（含回填时间）的记录页号超限，不进入本轮 |
+| A3 | 按机构和 UTC 日期分片；一个租户坏分片被定位且不阻断另一租户 |
+| A4 | 文件落盘后、登记前 SIGKILL：重跑收养同一文件，不丢数据、不生成重复 |
+| A5 | 登记后、清理前 SIGKILL：重跑收敛清理，不重写、不重复登记 |
+| A6 | 校验失败：保留 SQLite 原文、不登记坏分片、拒绝覆盖、`verify`/`trace` 定位 |
+| A7 | 归档扫描期间新写入的行保持未归档；下一快照再处理 |
+| A8 | 混合归档状态：成果版本、质量投影与 trace 仍可读，来源顺序一致 |
+| A9 | 只读预览不生成文件、不清正文、不建表，容量与分片数可信 |
+| A10 | 相同快照重跑复用已验证文件；另一快照不覆盖旧路径 |
+| A11 | 不修改抓取游标、水位、质量代次/进度；批次编号与阶段可查询 |
+| A12 | 分片格式可用标准库独立复算整份与逐页摘要 |
+
+```bash
+python3 tests/archive_acceptance.py   # 退出码 0 表示全通过
+```
