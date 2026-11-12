@@ -1,0 +1,28 @@
+{
+  "rule_version": "v1",
+  "description": "Baseline quality contract for harvested research results.",
+  "title": {
+    "required": true,
+    "min_length": 1,
+    "max_length": 2000,
+    "forbid_control_chars": true
+  },
+  "publication_year": {
+    "required": true,
+    "type": "integer",
+    "min": 1800,
+    "max": 2026
+  },
+  "doi": {
+    "required": false,
+    "normalize": {
+      "case": "lower",
+      "strip_prefixes": ["https://doi.org/", "http://doi.org/",
+                         "https://dx.doi.org/", "http://dx.doi.org/",
+                         "doi:", "DOI:"],
+      "trim_whitespace": true
+    },
+    "pattern": "^10\\.[0-9]{4,9}/[-._;()/:a-z0-9]+$",
+    "max_length": 512
+  }
+}
