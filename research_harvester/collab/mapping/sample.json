@@ -1,0 +1,30 @@
+{
+  "mapping_version": "sample-v1",
+  "institutions": [
+    {
+      "code": "INST-A",
+      "name": "Alpha University",
+      "aliases": ["Alpha Univ", "AU"]
+    },
+    {
+      "code": "INST-B",
+      "name": "Beta Institute",
+      "aliases": ["Beta Inst"]
+    },
+    {
+      "code": "INST-C",
+      "name": "Gamma College",
+      "aliases": ["Gamma Coll"]
+    },
+    {
+      "code": "INST-D",
+      "name": "Delta Laboratory",
+      "aliases": ["Delta Lab"]
+    },
+    {
+      "code": "INST-E",
+      "name": "Epsilon Center",
+      "aliases": []
+    }
+  ]
+}

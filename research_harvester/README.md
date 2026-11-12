@@ -35,6 +35,23 @@ search/engine.py         AST 在完整命中文档集合上做集合运算、快
 search/naive.py          朴素逐篇参考解释器，验收时与倒排引擎逐篇对照
 run_search.py            独立检索入口（CLI）：index/update/rebuild/repair/
                          query/status/explain
+collab/mapping.py        机构对照表：加载、严格校验（同一名称不得归属两个
+                         代码）、规范化内容摘要（digest）、精确名称解析
+collab/mapping/sample.json
+                         样例对照表（5 家机构，含别名）
+collab/store.py          合作网络库（collab_ 前缀表，独立 SQLite 文件）：
+                         元数据/对照表快照/游标/账本/采用论文/逐论文贡献/
+                         边权聚合/未识别单位诊断
+collab/builder.py        增量建图器：落地库只读、逐论文贡献原子替换、
+                         连续前缀游标、崩溃屏障、迟到低修订不覆盖
+collab/engine.py         只读查询：邻居（权重降序翻页）、最小跳数路径
+                         （等长取代码序列字典序最小、逐跳带权重与支撑论文）、
+                         边来源解释；单快照一致读
+run_collab.py            合作网络入口（CLI）：update/rebuild/neighbors/
+                         path/edge/diagnose/status
+tests/collab_acceptance.py
+                         合作网络验收断言（12 组场景，含真实 SIGKILL 中断
+                         贡献替换、独立重算对照，全离线）
 tests/search_acceptance.py
                          本地检索验收断言（16 组场景，含真实 SIGKILL，全离线）
 tests/fixtures/legacy_indexer.py
@@ -70,6 +87,7 @@ python3 tests/acceptance.py
 python3 tests/quality_acceptance.py
 python3 tests/crash_consistency_acceptance.py
 python3 tests/archive_acceptance.py
+python3 tests/collab_acceptance.py
 ```
 
 `run_fetch.py` 结束时打印每个租户的已确认区间 `[origin, high_watermark]`、
@@ -654,4 +672,165 @@ python3 tests/acceptance.py          # 原采集器验收，保持兼容
 python3 tests/quality_acceptance.py
 python3 tests/crash_consistency_acceptance.py
 python3 tests/archive_acceptance.py
+```
+
+# 机构合作网络分析（collaboration network）
+
+采集器只负责落地，**合作网络层回答"机构之间谁和谁共同发表过、合作多强、
+能否通过合作伙伴连起来"**。它是完全离线的独立模块：分析结果放在**独立的
+SQLite 网络文件**里，落地库以只读方式打开，不修改任何采集/质量/归档/检索
+表，不联网，不接入抓取线程。样例数据通过原有落地表正常添加即可，抓取器
+不需要任何新接口。
+
+## 数据字段与对照表格式
+
+作者单位取自 `payload.authors`：每名作者是含 `name` 和 `affiliations` 的
+对象，`affiliations` 是单位名称字符串列表，例如：
+
+```json
+{"title": "...", "authors": [
+  {"name": "Ann", "affiliations": ["Alpha University", "Alpha Univ"]},
+  {"name": "Bob", "affiliations": ["Beta Institute"]}]}
+```
+
+机构对照表是本地 JSON 文件（样例见 `collab/mapping/sample.json`），用稳定
+机构代码标识节点，并列出各机构的正式名称与别名：
+
+```json
+{
+  "mapping_version": "sample-v1",
+  "institutions": [
+    {"code": "INST-A", "name": "Alpha University",
+     "aliases": ["Alpha Univ", "AU"]}
+  ]
+}
+```
+
+- **校验即契约**：`code`/`name` 必须是非空字符串且代码唯一；`aliases` 是
+  字符串数组；**同一名称（正式名或别名）不允许分配给两个代码**，违反时
+  拒绝加载（退出码 3）并指出冲突的名称与两个代码。
+- **解析只做精确字符串相等**，绝不按名称相似度猜机构。无法归属的名称
+  进入诊断（`diagnose` 命令、建图报告计数），**不会**被合并成某个公共
+  "未知"节点，也不会产生任何边。
+- **网络文件绑定对照表内容摘要**：首次建图把对照表的规范化内容 SHA256
+  （机构按代码排序、别名排序去重后计算）写入网络文件。之后任何
+  `update`/`rebuild` 必须提供**同一内容**的对照表；换了映射会被拒绝
+  （退出码 3）并提示**另建一个网络文件**，绝不悄悄混用两套单位口径。
+  旧网络文件的查询不受拒绝影响，仍可正常使用。
+
+## 建图语义
+
+- 论文主键仍是 `(tenant, accession)`；**每个租户计算各自的网络**，查询
+  必须指定租户，结果绝不跨租户。
+- 一篇论文先把所有作者的单位逐一映射、**去重**为机构集合，再让不同机构
+  两两组成无向边；同单位作者再多也**不产生自环、不放大权重**。边的权重
+  是**共同参与的不同成果数**，不是作者人数。
+- 每篇论文采用**最高 revision** 的贡献：修改单位会在**同一个事务**里扣掉
+  这篇论文原先的边贡献再加入新贡献；撤回移除贡献；之后更高的非撤回修订
+  可以恢复；**晚到的较低修订只记账本、永不覆盖**已采用的贡献。
+- 增量进度沿用"连续已消费前缀"游标：首次建图全量扫描，之后每次只读
+  `rowid > 水位` 的新行，**不会为新输入重新遍历全部论文**；账本按身份
+  `(tenant, accession, revision)` + 内容哈希吸收重传，**同一论文的同一
+  修订不会重复贡献**；已追平的网络再次运行**无任何业务写入**。
+- **崩溃一致性**：每个提交分块把"删旧贡献、加新贡献、边权增减、账本、
+  游标推进"放在**一个事务**里。进程在删旧与加新之间被 SIGKILL，整个
+  事务回滚——不会留下负权重、零权重的空壳边（边权重归零即整行删除），
+  也不会多算成果；重启后从持久水位继续，收敛到与独立重算一致的状态。
+- 权重不变量可随时核对：`collab_edges.weight` 恒等于 `collab_contrib`
+  中该边的支撑论文行数（验收脚本逐边断言）。
+
+## 三个查询入口
+
+所有查询在**一个 WAL 读快照**内完成：即使查询横跨一次写入提交，邻居
+列表、路径、权重与来源解释都来自同一个视图。机构代码必须在网络文件
+绑定的对照表快照中，未知代码、负阈值、非法分页都是明确错误（退出码 2）。
+
+- **邻居查询**：按合作权重降序、机构代码升序翻页，返回**完整邻居总数**
+  （`total` 与分页无关）。
+- **连接路径查询**：在边权 `>= --min-weight` 的子图中找**最少跳数**
+  路线；多条等长路线取**整条代码序列字典序最小**者；找不到时明确返回
+  无路径（退出码仍为 0，输出 `NO PATH` 与原因）。**每一跳都带真实权重
+  和支撑论文**（编号 + 采用修订），不只是一串节点名。
+- **边来源查询**：列出支撑该边的论文编号、**采用修订**，以及归一前的
+  作者单位原文（按端点分组），能解释这条合作关系为什么存在。端点顺序
+  自动规范化；不存在的边返回 weight 0 而不是报错。
+
+## 命令
+
+```bash
+cd research_harvester
+
+# 建图/追平（首次运行绑定对照表摘要；落地库只读打开）
+python3 run_collab.py update --db out/harvest.db --net out/collab.db \
+    --mapping collab/mapping/sample.json
+
+# 显式丢弃并整体重建（仍要求同一份对照表内容）
+python3 run_collab.py rebuild --db out/harvest.db --net out/collab.db \
+    --mapping collab/mapping/sample.json
+
+# 邻居：权重降序、代码升序、翻页、完整总数
+python3 run_collab.py neighbors --net out/collab.db --tenant alpha \
+    --inst INST-A --min-weight 1 --limit 10 --offset 0 --json
+
+# 路径：最小跳数 + 字典序最小序列，逐跳带权重与支撑论文
+python3 run_collab.py path --net out/collab.db --tenant alpha \
+    --from INST-A --to INST-D --min-weight 1 --json
+
+# 边来源：支撑论文、采用修订、归一前的作者单位
+python3 run_collab.py edge --net out/collab.db --tenant alpha \
+    --a INST-A --b INST-B --json
+
+# 未识别单位诊断（不产生节点、不合并成公共节点）
+python3 run_collab.py diagnose --net out/collab.db
+
+# 网络元数据：绑定的对照表摘要、各租户游标、论文/边计数
+python3 run_collab.py status --net out/collab.db --json
+```
+
+退出码：`0` 成功（含"无路径"、空结果）；`2` 参数错误（未知机构、负阈值、
+缺租户、落地表缺失）；`3` 对照表非法或内容摘要与网络绑定不符。
+
+## 网络库表（全部 `collab_` 前缀，独立文件，增量创建）
+
+| 表 | 用途 |
+|---|---|
+| `collab_meta` | schema 版本、绑定的对照表内容摘要与版本、上次同步时间 |
+| `collab_inst` | 对照表机构快照（代码、正式名、别名），查询自足、拒绝未知代码 |
+| `collab_cursor` | 每租户已消费 rowid 的连续前缀末端（真正的读取位置） |
+| `collab_ledger` | 已消费身份 + 内容哈希：重传幂等吸收，同一修订不重复贡献 |
+| `collab_papers` | 每篇论文当前采用的最高 revision 与撤回标记 |
+| `collab_paper_orgs` | 采用修订的机构代码 → 归一前的单位原文列表（边来源解释） |
+| `collab_unmapped` | 采用修订中无法归属的单位名称（诊断；不构成节点） |
+| `collab_contrib` | 逐论文边贡献（tenant, accession, code_a, code_b, revision） |
+| `collab_edges` | 无向边聚合：weight = 不同支撑成果数；归零即删除，无空壳边 |
+
+## 合作网络验收场景（tests/collab_acceptance.py）
+
+样本固定安排：重复作者单位与别名（P1 同机构三名作者三种写法）、三角合作
+（A-B、B-C、A-C）、等长候选路径（B→D 的 B-A-D 与 B-C-D）；随后演示论文改
+单位（P5 r2：旧边 A-D 消失、新边 B-D 出现）、撤回断路（P10 撤回后 E 孤立、
+路径明确不存在）、更高版本恢复连通，以及另一租户同名论文不掺入结果。
+
+| 场景 | 断言 |
+|---|---|
+| N1 | 别名/重复单位去重；权重按不同成果数而非作者人数；无自环；三角边齐全 |
+| N2 | 邻居按权重降序+代码升序，翻页无缺口无重复，total 为完整总数；未知机构/负阈值/非法分页明确报错 |
+| N3 | 最少跳数；等长路线取代码序列字典序最小；逐跳真实权重与支撑论文；min-weight 子图中明确无路径 |
+| N4 | 边来源列出论文编号、采用修订、归一前单位原文；端点顺序规范化；不存在的边返回 weight 0 |
+| N5 | 改单位扣旧边加新边；撤回移除；更高修订恢复；同内容重传零写入；迟到低修订只记账本不覆盖 |
+| N6 | 同一 accession 跨租户各自成网，互不泄漏 |
+| N7 | 已追平重跑所有表逐字节不变；单条新输入只产生单条应用，不全量重扫 |
+| N8 | 贡献替换写入中途真实 SIGKILL：状态回滚到分块前，无负权重/空壳边/重复计数；重启后边权、论文集合、路线与独立重算一致 |
+| N9 | 换映射被拒绝并提示另建网络；旧网络仍可查询；一名称两代码的对照表拒绝加载；新网络文件可用新映射 |
+| N10 | 未识别单位全部列入诊断；不产生公共节点、不产生边；节点集合恰为对照表代码 |
+| N11 | 查询快照期间另一连接提交更新，本次邻居/路径/边来源仍来自同一旧视图 |
+| N12 | 从落地样本独立重算的论文集合、边权、路线与模块逐一一致；落地库在建图与查询后逐字节不变（只读） |
+
+```bash
+python3 tests/collab_acceptance.py   # 退出码 0 表示全通过（12 组场景）
+python3 tests/acceptance.py          # 原各层验收，保持兼容
+python3 tests/quality_acceptance.py
+python3 tests/crash_consistency_acceptance.py
+python3 tests/archive_acceptance.py
+python3 tests/search_acceptance.py
 ```
