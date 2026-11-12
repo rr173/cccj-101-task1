@@ -1,0 +1,96 @@
+
+=== 取证：当前二进制对 diagnose 的实际响应（修复前后对照用） ===
+  不带 --tenant：exit=2
+  stdout 首行: <empty>
+  带 --tenant alpha：exit=0
+
+=== R1 文本 diagnose --tenant alpha：不串 beta 数据 ===
+  [PASS] 退出码 0
+  [PASS] 文本标明所选租户 alpha
+  [PASS] 列出 alpha 未映射名称 'Alpha Unknown One'
+  [PASS] 'Alpha Unknown One' 报告正确成果数 papers=2
+  [PASS] 'Alpha Unknown One' 下列出成果编号 A1
+  [PASS] 'Alpha Unknown One' 下列出成果编号 A2
+  [PASS] 列出 alpha 未映射名称 'Alpha Unknown Two'
+  [PASS] 'Alpha Unknown Two' 报告正确成果数 papers=1
+  [PASS] 'Alpha Unknown Two' 下列出成果编号 A2
+  [PASS] 不出现 beta 的未映射名称 'Beta Unknown Two'
+  [PASS] 不出现 beta 的未映射名称 'Beta Unknown One'
+  [PASS] 不出现 beta 的成果编号 B2
+  [PASS] 不出现 beta 的成果编号 B1
+
+=== R2 文本 diagnose --tenant beta：不串 alpha 数据 ===
+  [PASS] 退出码 0
+  [PASS] 文本标明所选租户 beta
+  [PASS] 列出 'Beta Unknown One' 且成果数=1
+  [PASS] 'Beta Unknown One' 下列出成果编号 B1
+  [PASS] 列出 'Beta Unknown Two' 且成果数=1
+  [PASS] 'Beta Unknown Two' 下列出成果编号 B2
+  [PASS] 不出现 alpha 的名称 'Alpha Unknown One'
+  [PASS] 不出现 alpha 的名称 'Alpha Unknown Two'
+  [PASS] 不出现 alpha 的成果编号 A2
+  [PASS] 不出现 alpha 的成果编号 A1
+  [PASS] 不出现 alpha 的成果编号 A3
+
+=== R3 JSON diagnose --tenant alpha：结构与编号严格属于 alpha ===
+  [PASS] JSON 顶层标明所选租户 alpha
+  [PASS] JSON 名称集合恰为 alpha 的两个未映射名称
+  [PASS] 'Alpha Unknown One' 成果数与编号完全一致
+  [PASS] 'Alpha Unknown One' 条目租户标记为 alpha
+  [PASS] 'Alpha Unknown Two' 成果数与编号完全一致
+  [PASS] 'Alpha Unknown Two' 条目租户标记为 alpha
+  [PASS] 按成果数降序、名称升序排列
+  [PASS] 所有编号都属于 alpha 的成果集合
+  [PASS] 不存在任何其他租户的条目
+
+=== R4 JSON diagnose --tenant beta：结构与编号严格属于 beta ===
+  [PASS] JSON 顶层标明所选租户 beta
+  [PASS] JSON 名称集合恰为 beta 的两个未映射名称
+  [PASS] 'Beta Unknown One' 成果数与编号完全一致
+  [PASS] 'Beta Unknown One' 条目租户标记为 beta
+  [PASS] 'Beta Unknown Two' 成果数与编号完全一致
+  [PASS] 'Beta Unknown Two' 条目租户标记为 beta
+  [PASS] 所有编号都属于 beta 的成果集合
+
+=== R5 文本与 JSON 呈现一致 ===
+  [PASS] alpha: 文本含 'Alpha Unknown One' 与 papers=2
+  [PASS] alpha: 文本含编号 A1
+  [PASS] alpha: 文本含编号 A2
+  [PASS] alpha: 文本含 'Alpha Unknown Two' 与 papers=1
+  [PASS] alpha: 文本含编号 A2
+  [PASS] alpha: 文本/JSON 名称条目数一致
+  [PASS] beta: 文本含 'Beta Unknown One' 与 papers=1
+  [PASS] beta: 文本含编号 B1
+  [PASS] beta: 文本含 'Beta Unknown Two' 与 papers=1
+  [PASS] beta: 文本含编号 B2
+  [PASS] beta: 文本/JSON 名称条目数一致
+
+=== R6 空结果是正常返回，绝不回退全局查询 ===
+  [PASS] 无数据租户 gamma 退出码 0
+  [PASS] gamma 文本结果不含任何租户的未映射名称
+  [PASS] gamma JSON 为空列表 unmapped=[]
+  [PASS] 空结果仍标明请求的租户
+  [PASS] 未知租户 ID 同样是空结果而非全局数据
+
+=== R7 缺少 --tenant 与空白租户值都被拒绝（退出码 2） ===
+  [PASS] 缺少 --tenant 被拒绝
+  [PASS] 拒绝时 stdout 不输出任何诊断数据
+  [PASS] 空白租户值 '' 被拒绝
+  [PASS] 空白值 '' 不触发任何查询输出
+  [PASS] 空白值 '' 给出明确错误信息
+  [PASS] 空白租户值 '   ' 被拒绝
+  [PASS] 空白值 '   ' 不触发任何查询输出
+  [PASS] 空白值 '   ' 给出明确错误信息
+  [PASS] 空白租户值 '\t' 被拒绝
+  [PASS] 空白值 '\t' 不触发任何查询输出
+  [PASS] 空白值 '\t' 给出明确错误信息
+
+=== R8 其他命令与落地库不受影响 ===
+  [PASS] status 仍可正常运行
+  [PASS] status 仍是面向全网文件的汇总（含两个租户）
+  [PASS] neighbors 等既有查询命令行为不变
+  [PASS] neighbors 仍按其既有租户参数工作
+  [PASS] 原始落地库在所有 diagnose 查询后逐字节不变
+  [PASS] 网络库诊断数据未被查询修改或清理
+
+ALL PASSED: 0 个断言失败

@@ -13,7 +13,9 @@ path        minimum-hop route inside the min-weight subgraph; ties broken by
             the lexicographically smallest code sequence; explicit no-path
 edge        provenance of one edge: supporting papers, adopted revisions and
             the raw pre-normalization affiliation strings
-diagnose    unmapped affiliation names (they form no node, never merge)
+diagnose    unmapped affiliation names for ONE explicit tenant (they form no
+            node, never merge); a missing or blank --tenant is refused and
+            never degrades into a cross-tenant global listing
 status      network metadata: bound mapping digest, cursors, counts
 
 The network lives in its own SQLite file; the landing database is opened
@@ -190,15 +192,25 @@ def cmd_edge(args):
 
 
 def cmd_diagnose(args):
+    # diagnose 与 neighbors/path/edge 一样是租户入口：必须显式指定非空白
+    # 租户，缺参由 argparse 拦截（退出码 2），空白值在这里拦截——任何形式
+    # 的缺失都只能报错，绝不允许回退成跨租户的全局汇总。
+    tenant = args.tenant
+    if not isinstance(tenant, str) or not tenant.strip():
+        print("refused: diagnose 需要非空的 --tenant；不会执行跨租户汇总",
+              file=sys.stderr)
+        return 2
     conn = store.connect(args.net)
     store.init(conn)
     try:
         rows = conn.execute(
             "SELECT tenant, name, COUNT(DISTINCT accession) AS papers"
-            " FROM collab_unmapped GROUP BY tenant, name"
-            " ORDER BY tenant, papers DESC, name").fetchall()
+            " FROM collab_unmapped WHERE tenant=?"
+            " GROUP BY tenant, name"
+            " ORDER BY papers DESC, name", (tenant,)).fetchall()
         if args.json:
             print(json.dumps({
+                "tenant": tenant,
                 "unmapped": [dict(tenant=r["tenant"], name=r["name"],
                                   papers=r["papers"],
                                   accessions=[x["accession"] for x in
@@ -207,20 +219,21 @@ def cmd_diagnose(args):
                                                   " FROM collab_unmapped"
                                                   " WHERE tenant=? AND name=?"
                                                   " ORDER BY accession",
-                                                  (r["tenant"], r["name"]))])
+                                                  (tenant, r["name"]))])
                              for r in rows]},
                 ensure_ascii=False, indent=2, sort_keys=True))
             return 0
         if not rows:
+            print(f"tenant={tenant}")
             print("no unmapped affiliation names")
             return 0
+        print(f"tenant={tenant}")
         for r in rows:
-            print(f"{r['tenant']}: {r['name']!r}"
-                  f" papers={r['papers']}")
+            print(f"  {r['name']!r} papers={r['papers']}")
             for x in conn.execute(
                     "SELECT DISTINCT accession FROM collab_unmapped"
                     " WHERE tenant=? AND name=? ORDER BY accession",
-                    (r["tenant"], r["name"])):
+                    (tenant, r["name"])):
                 print(f"    {x['accession']}")
         return 0
     finally:
@@ -332,6 +345,10 @@ def main(argv=None):
 
     dg = sub.add_parser("diagnose")
     dg.add_argument("--net", required=True)
+    dg.add_argument("--tenant", required=True,
+                    help="mandatory tenant scope; diagnostics never mix"
+                         " tenants -- a blank value is refused instead of"
+                         " falling back to a cross-tenant global listing")
     dg.add_argument("--json", action="store_true")
     dg.set_defaults(func=cmd_diagnose)
 

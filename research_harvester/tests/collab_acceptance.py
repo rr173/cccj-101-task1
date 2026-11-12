@@ -806,10 +806,39 @@ def test_unmapped():
     check([r["name"] for r in rows]
           == ["Unknown Org X", "Unknown Org Y", "Unknown Org Z"],
           "every unmapped name is listed as a diagnostic", str(rows))
-    proc = fx.cli("diagnose", "--net", fx.net)
-    check(proc.returncode == 0 and "Unknown Org X" in proc.stdout
+    proc = fx.cli("diagnose", "--net", fx.net, "--tenant", "alpha")
+    check(proc.returncode == 0 and "tenant=alpha" in proc.stdout
+          and "Unknown Org X" in proc.stdout
           and "P7" in proc.stdout and "P8" in proc.stdout,
-          "diagnose lists names with their papers", proc.stdout.strip())
+          "diagnose lists the tenant's names with their papers",
+          proc.stdout.strip())
+    # tenant scoping: beta's paper is fully mapped, so beta gets a normal
+    # empty result and none of alpha's diagnostics leak across tenants
+    proc = fx.cli("diagnose", "--net", fx.net, "--tenant", "beta")
+    check(proc.returncode == 0 and "no unmapped affiliation names"
+          in proc.stdout and "Unknown Org X" not in proc.stdout,
+          "a tenant without pending names gets a normal empty result",
+          proc.stdout.strip())
+    proc = fx.cli("diagnose", "--net", fx.net, "--tenant", "alpha",
+                  "--json")
+    doc = json.loads(proc.stdout)
+    check(doc["tenant"] == "alpha"
+          and {e["name"] for e in doc["unmapped"]}
+          == {"Unknown Org X", "Unknown Org Y", "Unknown Org Z"}
+          and all(e["tenant"] == "alpha" for e in doc["unmapped"])
+          and all(set(e["accessions"]) <= {"P1", "P2", "P3", "P4", "P5",
+                                           "P6", "P7", "P8", "P9"}
+                  for e in doc["unmapped"]),
+          "JSON diagnose stays inside the selected tenant", str(doc))
+    # missing / blank tenant is a parameter error, never a global listing
+    proc = fx.cli("diagnose", "--net", fx.net)
+    check(proc.returncode == 2 and not proc.stdout.strip(),
+          "diagnose without --tenant is refused and prints no data",
+          proc.stderr.strip())
+    proc = fx.cli("diagnose", "--net", fx.net, "--tenant", "   ")
+    check(proc.returncode == 2 and not proc.stdout.strip(),
+          "a blank --tenant is refused instead of a global query",
+          proc.stderr.strip())
     # P7 {INST-A, X} and P8 {Y, Z}: if unmapped names merged into one node,
     # P7 would create A-? and P8 would create ?-? edges
     check(len(edges_of(fx, "alpha")) == 5,

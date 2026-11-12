@@ -48,7 +48,7 @@ collab/engine.py         只读查询：邻居（权重降序翻页）、最小�
                          （等长取代码序列字典序最小、逐跳带权重与支撑论文）、
                          边来源解释；单快照一致读
 run_collab.py            合作网络入口（CLI）：update/rebuild/neighbors/
-                         path/edge/diagnose/status
+                         path/edge/diagnose（必填租户）/status
 tests/collab_acceptance.py
                          合作网络验收断言（12 组场景，含真实 SIGKILL 中断
                          贡献替换、独立重算对照，全离线）
@@ -711,7 +711,10 @@ SQLite 网络文件**里，落地库以只读方式打开，不修改任何采�
   拒绝加载（退出码 3）并指出冲突的名称与两个代码。
 - **解析只做精确字符串相等**，绝不按名称相似度猜机构。无法归属的名称
   进入诊断（`diagnose` 命令、建图报告计数），**不会**被合并成某个公共
-  "未知"节点，也不会产生任何边。
+  "未知"节点，也不会产生任何边。`diagnose` 与其他查询一样以租户为必填
+  入口：只列出指定租户的未映射名称、涉及成果数与成果编号，缺参或空白
+  租户值按参数错误拒绝（退出码 2），绝不回退成跨租户全局汇总；该租户
+  没有待处理名称时返回退出码 0 的正常空结果。
 - **网络文件绑定对照表内容摘要**：首次建图把对照表的规范化内容 SHA256
   （机构按代码排序、别名排序去重后计算）写入网络文件。之后任何
   `update`/`rebuild` 必须提供**同一内容**的对照表；换了映射会被拒绝
@@ -780,8 +783,11 @@ python3 run_collab.py path --net out/collab.db --tenant alpha \
 python3 run_collab.py edge --net out/collab.db --tenant alpha \
     --a INST-A --b INST-B --json
 
-# 未识别单位诊断（不产生节点、不合并成公共节点）
-python3 run_collab.py diagnose --net out/collab.db
+# 未识别单位诊断：必须显式指定租户，只输出该租户的名称/成果数/编号；
+# 缺少 --tenant 或传空白值一律按参数错误拒绝（退出码 2），绝不跨租户汇总；
+# 该租户没有待处理名称时返回退出码 0 的正常空结果
+python3 run_collab.py diagnose --net out/collab.db --tenant alpha
+python3 run_collab.py diagnose --net out/collab.db --tenant alpha --json
 
 # 网络元数据：绑定的对照表摘要、各租户游标、论文/边计数
 python3 run_collab.py status --net out/collab.db --json
@@ -822,7 +828,7 @@ python3 run_collab.py status --net out/collab.db --json
 | N7 | 已追平重跑所有表逐字节不变；单条新输入只产生单条应用，不全量重扫 |
 | N8 | 贡献替换写入中途真实 SIGKILL：状态回滚到分块前，无负权重/空壳边/重复计数；重启后边权、论文集合、路线与独立重算一致 |
 | N9 | 换映射被拒绝并提示另建网络；旧网络仍可查询；一名称两代码的对照表拒绝加载；新网络文件可用新映射 |
-| N10 | 未识别单位全部列入诊断；不产生公共节点、不产生边；节点集合恰为对照表代码 |
+| N10 | 未识别单位全部列入诊断（按必填租户隔离，编号不跨租户）；缺参/空白租户拒绝且不回退全局；无数据租户返回正常空结果；不产生公共节点、不产生边；节点集合恰为对照表代码 |
 | N11 | 查询快照期间另一连接提交更新，本次邻居/路径/边来源仍来自同一旧视图 |
 | N12 | 从落地样本独立重算的论文集合、边权、路线与模块逐一一致；落地库在建图与查询后逐字节不变（只读） |
 
