@@ -20,11 +20,52 @@ Guarantees implemented here
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Dict, List, Optional
 
 from . import rules as rules_mod
 from . import store
+
+
+def make_crash_barrier():
+    """Build a test-only fault barrier from environment variables.
+
+    Returns ``None`` in normal operation (zero overhead, no behaviour change).
+    When ``RH_QUALITY_CRASH_POINT`` names a barrier point, the processor blocks
+    at that point after announcing it through ``RH_QUALITY_CRASH_MARKER``; the
+    test driver then delivers a real SIGKILL.  The points sit at real commit
+    boundaries, so a plain raised-exception/rollback test cannot substitute for
+    them:
+
+      after_counts_commit  summary counts durable, history transaction not yet
+                           started (the original divergence window)
+      stage_events_txn     inside the history transaction, before its commit
+      publish_txn          inside the final publish transaction, before the
+                           pointer flip
+    """
+    point = os.environ.get("RH_QUALITY_CRASH_POINT")
+    if not point:
+        return None
+    marker = os.environ.get("RH_QUALITY_CRASH_MARKER")
+    wait_file = os.environ.get("RH_QUALITY_CRASH_WAIT_FILE")
+
+    def barrier(name):
+        if name != point:
+            return
+        if marker:
+            with open(marker, "w", encoding="utf-8") as fh:
+                fh.write(name)
+                fh.flush()
+                os.fsync(fh.fileno())
+        if wait_file:
+            deadline = time.time() + 120
+            while time.time() < deadline and os.path.exists(wait_file):
+                time.sleep(0.01)
+        # fallback when the parent does not deliver the signal itself
+        os._exit(137)
+
+    return barrier
 
 
 class ProcessingRefused(Exception):
@@ -322,11 +363,15 @@ def _pending_rows(conn, tenant, rows, last_rowid):
 
 class Processor:
     def __init__(self, db_path, rule_snapshot, *, on_tenant_applied=None,
-                 now=time.time):
+                 now=time.time, crash_barrier=None):
         self.db_path = db_path
         self.rules = rule_snapshot
         self.on_tenant_applied = on_tenant_applied
         self._now = now
+        # test-only barrier; defaults to the env-driven one, which is inert
+        # unless RH_QUALITY_CRASH_POINT is set
+        self.crash_barrier = (crash_barrier if crash_barrier is not None
+                              else make_crash_barrier())
 
     # -- helpers ---------------------------------------------------------
     def _open(self):
@@ -360,6 +405,46 @@ class Processor:
             (tenant,)).fetchone()
         return None if not row or row["last_rowid"] is None else int(
             row["last_rowid"])
+
+    def _publish_ready_staging(self, conn, run_id, staging, *, skipped,
+                               stage_only, active_generation):
+        """Resume path for a batch whose history already committed.
+
+        The staging rows, pending inputs and pending events are all durable and
+        the generation carries the ``events_staged`` marker.  Rebuilding would
+        needlessly recompute (and re-insert) the same transition history, so we
+        verify and publish using only the state stored with this batch.
+        """
+        gen_id = staging["generation_id"]
+        counts = json.loads(staging["counts"])
+        store.verify_generation(conn, gen_id, counts)
+        event_count = store.staged_event_count(conn, gen_id)
+        new_inputs = conn.execute(
+            "SELECT COUNT(*) c FROM quality_pending_inputs"
+            " WHERE generation_id=?", (gen_id,)).fetchone()["c"]
+        if stage_only:
+            self._finish_run(conn, run_id, "staged", generation_id=gen_id,
+                             new_inputs=new_inputs, counts=counts,
+                             message="resumed: already fully staged")
+            return {"status": "staged", "run_id": run_id,
+                    "generation_id": gen_id, "resumed": True,
+                    "processed_tenants": [], "skipped_tenants": skipped,
+                    "published": False, "counts": counts,
+                    "new_inputs": new_inputs, "events": event_count,
+                    "active_generation": active_generation, "details": []}
+        result = store.publish_generation(
+            conn, gen_id, run_id=run_id, expected_counts=counts,
+            crash_barrier=self.crash_barrier)
+        self._finish_run(conn, run_id, "ok", generation_id=gen_id,
+                         new_inputs=new_inputs, counts=counts,
+                         message=f"resumed and published generation {gen_id}")
+        return {"status": "published", "run_id": run_id,
+                "generation_id": gen_id, "resumed": True,
+                "processed_tenants": [], "skipped_tenants": skipped,
+                "published": result.get("published", False),
+                "counts": counts, "new_inputs": new_inputs,
+                "events": event_count, "active_generation": gen_id,
+                "details": []}
 
     # -- main entry ------------------------------------------------------
     def process(self, *, tenants=None, reevaluate=False, resume=False,
@@ -411,9 +496,19 @@ class Processor:
 
         if resumed:
             # a suspended batch keeps the rule snapshot it started with, even
-            # if the file on disk changed while the process was down
+            # if the file on disk changed while the process was down; recovery
+            # always re-reads the configuration stored with the batch
             if staging["rule_sha256"] != self.rules.sha256:
                 self.rules = _snapshot_from_generation(staging)
+            readiness = store.staging_readiness(conn,
+                                                staging["generation_id"])
+            if readiness["publishable"]:
+                # projection *and* transition history are already durable; do
+                # not rebuild, do not re-stage (that would duplicate history).
+                return self._publish_ready_staging(
+                    conn, run_id, staging,
+                    skipped=skipped, stage_only=stage_only,
+                    active_generation=active_id)
 
         base_states = _base_states(conn, active_id, selected) if not resumed \
             else _base_states(conn, staging["base_generation_id"], selected)
@@ -554,7 +649,13 @@ class Processor:
             store.update_generation(conn, gen_id,
                                     input_watermarks=store.dumps(watermarks),
                                     counts=store.dumps(verified))
-        store.stage_events(conn, gen_id, events)
+        # Real commit boundary: counts are durable but the history transaction
+        # has not started. A SIGKILL here leaves build_phase='building', so the
+        # batch cannot be published until --resume rebuilds it.
+        if self.crash_barrier is not None:
+            self.crash_barrier("after_counts_commit")
+        store.stage_events(conn, gen_id, events,
+                           crash_barrier=self.crash_barrier)
 
         if stage_only:
             self._finish_run(conn, run_id, "staged", generation_id=gen_id,
@@ -569,7 +670,8 @@ class Processor:
                     "details": processed}
 
         result = store.publish_generation(conn, gen_id, run_id=run_id,
-                                          expected_counts=verified)
+                                          expected_counts=verified,
+                                          crash_barrier=self.crash_barrier)
         self._finish_run(conn, run_id, "ok", generation_id=gen_id,
                          new_inputs=new_inputs, dirty=dirty, counts=verified,
                          message=f"published generation {gen_id}")

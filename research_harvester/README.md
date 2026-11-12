@@ -22,6 +22,9 @@ run_quality.py           独立质量处理入口（CLI）：process/status/trac
                          publish/discard-staging/generations/rules-check
 tests/acceptance.py      采集器验收断言（8 个场景，全部离线）
 tests/quality_acceptance.py  质量隔离层验收断言（16 个场景，全部离线）
+tests/crash_consistency_acceptance.py
+                         发布资格/崩溃一致性验收（6 个场景，真实 SIGKILL
+                         子进程故障 + 旧库迁移，全部离线）
 ```
 
 ## 离线运行命令
@@ -131,6 +134,51 @@ python3 tests/quality_acceptance.py
   丢弃；对已发布代次重复 publish 是无副作用的幂等操作。
 - 处理失败（核对失败、异常）不会推进已发布代次。
 
+### 发布资格与崩溃一致性
+
+投影内容（clean/quarantine/retracted 行）、汇总计数（`counts`）和变更履历
+（`quality_pending_events` → 发布时提升进 `quality_events`）分属不同的事务。
+**“counts 非空”不是可发布的充分条件**：在计数提交之后、履历事务提交之前被
+SIGKILL，会留下计数已耐久但履历缺失的 staging。旧实现仅凭 `counts` 放行
+`publish`，于是读者看到了新内容，`trace` 却只有旧原因。
+
+`quality_generations.build_phase` 是显式的完整性标记，取代对计数/事件条数的
+猜测：
+
+- `building`：构建中或在履历事务完成前被中断，**不可发布**；
+- `events_staged`：履历事务已提交，投影与履历都已耐久，**可发布**。
+
+标记与履历行在**同一个事务**写入，因此二者要么同时可见、要么同时回滚。判定
+永远基于标记而不是事件数量——一个正常的零事件批次（重评后所有判定都不变）
+也会被显式标记为 `events_staged`，不会被误拦；系统也不会临时编造一条
+“恢复事件”来掩盖缺失的履历。发布入口（`publish_generation` 与 `publish`
+子命令）统一通过 `staging_readiness()` 把关，不完整的批次返回退出码 4 并提示
+恢复命令。
+
+`--resume` 会先识别持久状态：标记为 `events_staged` 的批次履历已完整，直接
+核对并发布，不重建、不重复写履历；标记缺失或仍为 `building` 的批次按原逻辑
+从已发布基准 rebase 重建。恢复始终读回**该代次存储的规则快照**
+（`rule_content`），即使本地规则文件在停机期间被改写，也不会重新解释同一批
+数据。
+
+### 旧库迁移（build_phase 列）
+
+`init()` 以增量 `ALTER TABLE` 给旧库补列，历史行的标记保持 `NULL`，**不会**
+被统一盖成完成标记。发布入口对 `NULL` 标记的 staging 一律拒绝（无法证明其
+履历完整），按下列形态处置，命令均为
+`run_quality.py process --db <db> --resume`：
+
+| 旧 staging 形态 | 处置 |
+|---|---|
+| 只有汇总计数、无履历（本次缺陷的现场） | 拒绝 `publish`；`--resume` 重建并补全履历 |
+| 残留半个租户的投影行 | 拒绝 `publish`；`--resume` 清空该代次投影后整体重建 |
+| 投影/履历/计数看起来齐全，仅缺标记 | 同样拒绝（完整性不可推断）；`--resume` 重建后发布，履历不重复 |
+| 已发布/已退役的旧代次 | 原样保留，标记维持 `NULL`，不改动读者可见数据 |
+
+操作人员遇到旧 staging 时：能确认要继续这批数据就执行
+`process --resume`（沿用批次内的规则快照）；确认该批作废则执行
+`discard-staging` 丢弃后重新处理。不要直接 `publish`。
+
 ## 规则版本与重评
 
 - 一次处理只使用**开始时读取**的那份规则（快照同时存入代次表），处理中替换
@@ -185,7 +233,7 @@ python3 run_quality.py rules-check --rules quality/rules/v1.json
 
 | 表/视图 | 用途 |
 |---|---|
-| `quality_generations` | 代次元数据：状态、规则版本/哈希/原文、基准代次、计数 |
+| `quality_generations` | 代次元数据：状态、规则版本/哈希/原文、基准代次、计数、`build_phase` 完整性标记 |
 | `quality_pointer` | 唯一发布指针（id=1），读者视角的原子切换点 |
 | `quality_clean` / `quality_quarantine` / `quality_retracted` | 带 `generation_id` 的投影行 |
 | `quality_current_*` | 三个读者视图，只解析当前 pointer |
@@ -218,4 +266,20 @@ python3 run_quality.py rules-check --rules quality/rules/v1.json
 ```bash
 python3 tests/quality_acceptance.py   # 全部离线，退出码 0 表示全通过
 python3 tests/acceptance.py           # 原采集器验收，保持兼容
+python3 tests/crash_consistency_acceptance.py  # 崩溃一致性与旧库迁移
 ```
+
+## 崩溃一致性验收场景（tests/crash_consistency_acceptance.py）
+
+故障注入只在设置 `RH_QUALITY_CRASH_POINT` 环境变量时生效（生产路径零开销、
+行为不变）：子进程在命名屏障处写出标记文件并阻塞，测试驱动随后发送**真实
+SIGKILL**，因此复现的是已提交事务的持久状态，而非可回滚的普通异常。
+
+| 场景 | 断言 |
+|---|---|
+| C1 | 计数提交后、履历事务前被 kill：`publish` 退出码 4（旧实现为 0），读者停留旧代次；`--resume` 重建后论文转 clean、读取进度推进一次、前后原因完整；重复恢复不产生重复履历 |
+| C2 | 履历事务执行期间被 kill：事件行与标记随事务原子回滚，拒绝发布，resume 重建无重复 |
+| C3 | 最终发布事务期间被 kill：履历已耐久（`events_staged`），可直接发布或 resume 完成，指针只翻转一次、事件只提升一次 |
+| C4 | 零事件批次（重评后判定全不变）凭显式标记正常发布，不被误拦；后续无变化仍为 no-op |
+| C5 | 旧库三种 staging 形态（仅汇总/半个租户/看似齐全）均拒绝发布、由 resume 重建；已发布旧代次保持原样 |
+| C6 | 回归：年份质量判定与 DOI 双向冲突/自动解除在崩溃恢复后仍然正确，履历完整 |

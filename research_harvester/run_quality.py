@@ -49,7 +49,10 @@ from quality.processor import Processor, ProcessingRefused  # noqa: E402
 def _connect(db_path):
     if not os.path.exists(db_path):
         raise SystemExit(f"landing database not found: {db_path}")
-    return store.connect(db_path)
+    conn = store.connect(db_path)
+    # additive migration only: ensures build_phase exists on legacy databases
+    store.init(conn)
+    return conn
 
 
 def cmd_process(args):
@@ -115,8 +118,17 @@ def cmd_publish(args):
     staging = store.staging_generation(conn)
     if not staging:
         print("no staging generation to publish")
+        conn.close()
         return 0
     gen_id = staging["generation_id"]
+    readiness = store.staging_readiness(conn, gen_id)
+    if not readiness["publishable"]:
+        print(f"generation {gen_id} is not publishable: {readiness['reason']}",
+              file=sys.stderr)
+        print("use 'process --resume' to finish/rebuild it or "
+              "'discard-staging' to drop it", file=sys.stderr)
+        conn.close()
+        return 4
     try:
         counts = store.verify_generation(conn, gen_id)
         result = store.publish_generation(conn, gen_id, expected_counts=counts)
@@ -169,15 +181,17 @@ def cmd_generations(args):
     store.require_landing(conn)
     rows = [dict(r) for r in conn.execute(
         "SELECT generation_id, status, rule_version, rule_sha256,"
-        " base_generation_id, created_at, published_at, counts, message"
-        " FROM quality_generations ORDER BY generation_id DESC")]
+        " base_generation_id, created_at, published_at, counts, build_phase,"
+        " message FROM quality_generations ORDER BY generation_id DESC")]
     conn.close()
     if args.json:
         print(json.dumps(rows, indent=2, sort_keys=True))
         return 0
     for row in rows:
         counts = row["counts"] or "-"
+        phase = row["build_phase"] or "legacy"
         print(f"generation {row['generation_id']}: {row['status']}"
+              f" phase={phase}"
               f" rule={row['rule_version']}"
               f" base={row['base_generation_id']}"
               f" published_at={row['published_at']} counts={counts}")

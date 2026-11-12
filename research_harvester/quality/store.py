@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS quality_generations (
   base_generation_id INTEGER,            -- published projection this gen derives from
   input_watermarks TEXT,                 -- JSON {tenant: max result_versions.rowid}
   counts         TEXT,                   -- JSON counts at build time
+  build_phase    TEXT,                   -- building|events_staged (NULL on legacy rows)
   created_at     REAL NOT NULL,
   published_at   REAL,
   finished_at    REAL,
@@ -193,6 +194,17 @@ class IncompleteBuild(VerificationError):
     """Staged generation did not finish construction; resume or discard it."""
 
 
+# Build-phase markers stored on quality_generations.  ``counts`` alone is not a
+# publishability proof: the counts commit and the transition-history write are
+# separate transactions, so a crash between them leaves a projection whose
+# summary was committed but whose audit events were never made durable.  The
+# marker flips to EVENTS_STAGED in the *same* transaction that writes the
+# pending events (even when the event set is legitimately empty).
+PHASE_BUILDING = "building"
+PHASE_EVENTS_STAGED = "events_staged"
+_VALID_PHASES = (PHASE_BUILDING, PHASE_EVENTS_STAGED)
+
+
 def connect(path):
     conn = sqlite3.connect(path, timeout=30.0)
     conn.row_factory = sqlite3.Row
@@ -209,6 +221,21 @@ def init(conn):
         conn.execute(
             "INSERT INTO quality_pointer(id, generation_id, updated_at)"
             " VALUES (1, NULL, NULL) ON CONFLICT(id) DO NOTHING")
+        _migrate_build_phase(conn)
+
+
+def _migrate_build_phase(conn):
+    """Add the build-phase column to databases created by an older version.
+
+    Legacy rows keep a NULL marker on purpose: we cannot prove whether their
+    transition history is complete, so they must never be auto-stamped ready.
+    New builds own their marker explicitly from creation onward.
+    """
+    columns = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(quality_generations)")}
+    if "build_phase" not in columns:
+        conn.execute(
+            "ALTER TABLE quality_generations ADD COLUMN build_phase TEXT")
 
 
 def require_landing(conn):
@@ -369,7 +396,19 @@ def verify_generation(conn, generation_id, expected_counts=None):
     return counts
 
 
-def stage_events(conn, generation_id, events):
+def stage_events(conn, generation_id, events, crash_barrier=None):
+    """Persist the transition history and the completeness marker together.
+
+    The marker flip and the event rows share one transaction, so after commit
+    the history is either fully durable with an ``events_staged`` marker or
+    absent entirely with the generation still in ``building``.  A batch with
+    zero events is marked ready explicitly -- event count is never used as the
+    completeness signal, so an empty legitimate batch is not blocked.
+
+    ``crash_barrier`` (test-only) is invoked after the event rows are written
+    but before the transaction commits, letting a SIGKILL test prove that the
+    uncommitted marker leaves the generation unpublishable.
+    """
     with conn:
         conn.execute("DELETE FROM quality_pending_events WHERE generation_id=?",
                      (generation_id,))
@@ -384,6 +423,11 @@ def stage_events(conn, generation_id, events):
                  ev.get("to_state"), ev.get("rule_version"),
                  ev.get("rule_version_before"),
                  dumps(ev.get("details") or {})))
+        if crash_barrier is not None:
+            crash_barrier("stage_events_txn")
+        conn.execute(
+            "UPDATE quality_generations SET build_phase=? WHERE generation_id=?",
+            (PHASE_EVENTS_STAGED, generation_id))
 
 
 def staged_event_count(conn, generation_id):
@@ -392,13 +436,58 @@ def staged_event_count(conn, generation_id):
         (generation_id,)).fetchone()["c"]
 
 
-def publish_generation(conn, generation_id, run_id=None, expected_counts=None):
+def staging_readiness(conn, generation_id):
+    """Classify the durable state of a staging generation.
+
+    Returns a dict describing whether the batch can be delivered as-is.  The
+    decision is based on the build-phase marker, not on the presence of rows:
+    a zero-event batch is complete, while a legacy/half-written batch is not.
+
+    publishable      marker proves both projection and history are durable
+    rebuild_required marker missing/incomplete (crash gap or legacy staging):
+                     the events transaction never committed; resume rebuilds
+    reason           machine-readable explanation for operators
+    """
+    gen = get_generation(conn, generation_id)
+    if gen is None:
+        raise ValueError(f"unknown generation {generation_id}")
+    phase = gen.get("build_phase") if gen is not None else None
+    if gen["status"] != "staging":
+        return {"publishable": False, "rebuild_required": False,
+                "phase": phase,
+                "reason": f"generation is {gen['status']}, not staging"}
+    if phase == PHASE_EVENTS_STAGED:
+        return {"publishable": True, "rebuild_required": False,
+                "phase": phase,
+                "reason": "projection and transition history are durable"}
+    if phase == PHASE_BUILDING:
+        return {"publishable": False, "rebuild_required": True,
+                "phase": phase,
+                "reason": "build was interrupted before the transition "
+                          "history committed; resume rebuilds this batch"}
+    # NULL or unknown value: a legacy database (older schema) or tampered row.
+    # Do not stamp it complete -- its history completeness cannot be proven.
+    return {"publishable": False, "rebuild_required": True,
+            "phase": phase,
+            "reason": "no durable completeness marker (legacy or partial "
+                      "staging); resume rebuilds this batch from its stored "
+                      "rule snapshot"}
+
+
+def publish_generation(conn, generation_id, run_id=None, expected_counts=None,
+                       crash_barrier=None):
     """Atomically make a staging generation visible. Idempotent.
 
     One transaction: verify the staging rows one final time, absorb each
     tenant's pending inputs into the input ledger, advance per-tenant progress,
     promote staged transition events, flip the single pointer, retire the
     previous generation.
+
+    Publishability is decided by the build-phase marker (see
+    :func:`staging_readiness`), never by ``counts`` being non-null or by the
+    number of staged events.  ``crash_barrier`` (test-only) fires inside the
+    publish transaction so a SIGKILL there leaves the pointer untouched and a
+    retry stays idempotent.
     """
     gen = get_generation(conn, generation_id)
     if gen is None:
@@ -408,10 +497,11 @@ def publish_generation(conn, generation_id, run_id=None, expected_counts=None):
     if gen["status"] != "staging":
         raise ValueError(
             f"generation {generation_id} is {gen['status']}, cannot publish")
-    if gen["counts"] is None:
+    readiness = staging_readiness(conn, generation_id)
+    if not readiness["publishable"]:
         raise IncompleteBuild(
-            f"generation {generation_id} has no completed build; resume it or"
-            " discard it")
+            f"generation {generation_id} is not publishable: "
+            f"{readiness['reason']}; resume it or discard it")
     now = time.time()
     with conn:
         # never flip the pointer for an inconsistent projection
@@ -464,6 +554,8 @@ def publish_generation(conn, generation_id, run_id=None, expected_counts=None):
             (generation_id, now, generation_id))
         conn.execute("DELETE FROM quality_pending_events WHERE generation_id=?",
                      (generation_id,))
+        if crash_barrier is not None:
+            crash_barrier("publish_txn")
         # atomic visibility switch
         previous = conn.execute(
             "SELECT generation_id FROM quality_pointer WHERE id=1"
@@ -494,16 +586,17 @@ def create_generation(conn, rules, watermarks, message=None,
     cur = conn.execute(
         "INSERT INTO quality_generations(status, rule_version, rule_sha256,"
         " rule_content, base_generation_id, input_watermarks, counts,"
-        " created_at, message) VALUES ('staging',?,?,?,?,?,NULL,?,?)",
+        " build_phase, created_at, message)"
+        " VALUES ('staging',?,?,?,?,?,NULL,?, ?,?)",
         (rules.version, rules.sha256, rules.content, base_generation_id,
-         dumps(watermarks), now, message))
+         dumps(watermarks), PHASE_BUILDING, now, message))
     return cur.lastrowid
 
 
 def update_generation(conn, generation_id, **fields):
-    allowed = {"status", "input_watermarks", "counts", "published_at",
-               "finished_at", "message", "rule_version", "rule_sha256",
-               "rule_content", "base_generation_id"}
+    allowed = {"status", "input_watermarks", "counts", "build_phase",
+               "published_at", "finished_at", "message", "rule_version",
+               "rule_sha256", "rule_content", "base_generation_id"}
     sets = []
     params = []
     for key, value in fields.items():
@@ -561,6 +654,7 @@ def status(conn):
             "generation_id": staging["generation_id"],
             "rule_version": staging["rule_version"],
             "status": staging["status"],
+            "build_phase": staging["build_phase"],
             "created_at": staging["created_at"],
         } if staging else None,
         "counts": current_counts(conn),
