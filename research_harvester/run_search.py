@@ -6,6 +6,8 @@ Commands
 index      build the index from the landing database (first full build)
 update     catch up with landing rows written since the last index/update
 rebuild    drop and rebuild the whole index (explicit full re-scan)
+repair     audit legacy progress in the consumed rowid range, recover rows the
+           old rule skipped, then resume incremental catch-up (idempotent)
 query      run one boolean expression against a consistent snapshot
 status     index metadata, per-tenant cursors, document and term counts
 explain    show the parsed syntax tree and normalized leaf terms
@@ -72,6 +74,25 @@ def cmd_rebuild(args):
         print(f"refused: {exc}", file=sys.stderr)
         return 2
     _print_report(report)
+    return 0
+
+
+def cmd_repair(args):
+    indexer = Indexer(args.index, args.db)
+    try:
+        report = indexer.repair(tenants=_tenants(args.tenants))
+    except LandingMissing as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 2
+    for tr in report.tenants:
+        scope = (f"audited_rowids={tr.audited_from}..{tr.audited_to}"
+                 f" missing_identities={tr.missing_identities}"
+                 f" rewind_to={tr.rewind_to}")
+        print(f"repair {tr.tenant}: {tr.status} {scope}")
+        for item in tr.missing:
+            print(f"  recovered {item.accession}"
+                  f" revision={item.revision}"
+                  f" source_rowid={item.source_rowid}")
     return 0
 
 
@@ -158,11 +179,19 @@ def cmd_status(args):
         skips = conn.execute(
             "SELECT tenant, field, COUNT(*) c FROM search_skips"
             " GROUP BY tenant, field ORDER BY tenant, field").fetchall()
+        repairs = [dict(r) for r in conn.execute(
+            "SELECT * FROM search_repair ORDER BY tenant")]
+        repair_missing = conn.execute(
+            "SELECT COUNT(*) c FROM search_repair_missing m"
+            " JOIN search_repair r ON r.tenant=m.tenant"
+            " WHERE r.status <> 'done'").fetchone()["c"]
         if args.json:
             print(json.dumps({
                 "meta": meta,
                 "cursors": [dict(r) for r in conn.execute(
                     "SELECT * FROM search_cursor ORDER BY tenant")],
+                "repair": repairs,
+                "repair_missing": repair_missing,
                 "documents": [dict(r) for r in docs],
                 "terms": terms, "postings": postings,
                 "skips": [dict(r) for r in skips]},
@@ -179,6 +208,13 @@ def cmd_status(args):
                   f"{r['r'] or 0})")
         for r in skips:
             print(f"skips {r['tenant']} {r['field']}: {r['c']}")
+        for r in repairs:
+            print(f"repair {r['tenant']}: status={r['status']}"
+                  f" audit={r['audit_from']}..{r['audit_to']}"
+                  f" missing={r['missing_count']}"
+                  f" rewind_to={r['rewind_to']}")
+        if repair_missing:
+            print(f"repair_outstanding={repair_missing}")
         return 0
     finally:
         conn.close()
@@ -234,7 +270,7 @@ def main(argv=None):
                         help="comma-separated tenant ids (default all)")
 
     for name, func in (("index", cmd_index), ("update", cmd_update),
-                       ("rebuild", cmd_rebuild)):
+                       ("rebuild", cmd_rebuild), ("repair", cmd_repair)):
         sp = sub.add_parser(name)
         add_db(sp)
         sp.set_defaults(func=func)

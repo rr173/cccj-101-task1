@@ -28,15 +28,17 @@ search/parser.py         布尔表达式解析器：字段/括号/短语/AND/OR/
                          语法错误带字符位置，绝不拼 SQL、绝不回退文本搜索
 search/store.py          独立检索库（search_ 前缀表）：词典、带位置/区间的
                          倒排表、文档、水位、消费账本、跳过原因
-search/indexer.py        增量索引器：rowid 水位追平、账本识别迟到/改写、
-                         单事务原子落定、撤回/恢复、硬退出屏障
+search/indexer.py        增量索引器：连续已消费前缀进度、账本识别迟到/改写、
+                         单事务原子落定、撤回/恢复、硬退出屏障、旧进度修复
 search/engine.py         AST 在完整命中文档集合上做集合运算、快照读、
                          相关性/编号排序、分页与原文半开区间高亮
 search/naive.py          朴素逐篇参考解释器，验收时与倒排引擎逐篇对照
-run_search.py            独立检索入口（CLI）：index/update/rebuild/query/
-                         status/explain
+run_search.py            独立检索入口（CLI）：index/update/rebuild/repair/
+                         query/status/explain
 tests/search_acceptance.py
-                         本地检索验收断言（11 组场景，含真实 SIGKILL，全离线）
+                         本地检索验收断言（16 组场景，含真实 SIGKILL，全离线）
+tests/fixtures/legacy_indexer.py
+                         冻结的旧版索引器，仅用于在验收中真实写出坏进度现场
 run_fetch.py             可配置抓取入口（CLI），输出每租户已确认区间与版本计数
 run_quality.py           独立质量处理入口（CLI）：process/status/trace/
                          publish/discard-staging/generations/rules-check
@@ -507,25 +509,60 @@ leaf     := [字段 ':'] ( 短语 | 词 )
 
 - 身份沿用采集库的 `(tenant, accession, revision)`。**每个机构同一成果只展示
   最新修订**：索引里 `(tenant, accession)` 唯一，仅存当前修订的原文与倒排行。
-- 消费进度：每机构 `search_cursor` 记录已消费到的 `result_versions.rowid`
-  水位；另有 `search_ledger` 记录每个身份的内容哈希。首次建索引全量扫描，之后
-  `update` 只读 `rowid > 水位` 的新行，**不会每次全文重扫源表**。采集落地是只
-  追加的（仅 `INSERT OR IGNORE`，rowid 单调），因此迟到版本的 rowid 也高于水位、
-  必被增量读到；账本让重传的相同身份幂等吸收。若有人在库外原地改写旧行，可用
-  显式 `rebuild` 整体对账。
-- 新版本：在**同一事务**内删旧倒排、写新倒排、换当前修订原文，并把水位推进到
-  本提交分块已处理的最大 rowid，因此不会出现“搜到旧词却显示新摘要”。迟到的
-  较小修订永远不覆盖当前文本。
+- 消费进度：每机构 `search_cursor` 记录**已消费 rowid 的连续前缀末端**。规则是：
+  rowid R 被视为已消费，当且仅当 `result_versions` 中该机构所有 `rowid ≤ R` 的行
+  都已在已提交事务里落定（或已由 `search_ledger` 中同一身份、同一 `source_rowid`
+  且内容哈希一致的记录确认过）。因此“某批处理到的最大 rowid”不是合法进度：
+  同一成果的多个修订可以交错很远，一个较晚成果的旧行也可能落在已提交行号之下。
+  首次建索引全量扫描，之后 `update` 只读 `rowid > 水位` 的新行，**不会每次全文
+  重扫源表**。采集落地是只追加的（仅 `INSERT OR IGNORE`，rowid 单调），因此迟到
+  版本的 rowid 也高于水位、必被增量读到；账本让重传的相同身份幂等吸收。每次
+  `update` 开始时冻结落地视图（`MAX(rowid)`），运行期间新追加的行留给下一次
+  显式更新，不会被本次进度误标为已处理。若有人在库外原地改写旧行，用显式
+  `repair` 对账。
+- 新版本：在**同一事务**内删旧倒排、写新倒排、换当前修订原文、记账本，并把水位
+  推进到本提交分块的**连续前缀末端**，因此不会出现“搜到旧词却显示新摘要”，也
+  不会出现“水位越过尚未提交的成果”。分块按落地 rowid 顺序切分，而不是按成果
+  聚合后切分；同一成果跨块时，以该块连续前缀内的最新修订为准，由后一块继续
+  推进到真正的当前修订。迟到的较小修订永远不覆盖当前文本。
 - 撤回（最新修订 `retracted=1`）：文档从检索中删除（结果里消失）；之后更高的
   非撤回修订到达时重新写入、恢复可搜。
 - **空摘要**：不产生摘要倒排，但标题照常可检索，并在返回里标注“空摘要”。
 - **非文本字段**：对象、数组、数字等绝不 `str()` 成字符串混入索引；该字段跳过，
   原因写入 `search_skips` 并随文档行的 `title_skip`/`abstract_skip` 返回。
-- **原子落定与续跑**：数据按固定分块（默认每块 500 个成果）提交，每个分块的
-  词位、原文、当前修订与该块水位在一个事务里落定。进程在事务提交前被硬退出
-  （验收用真实 SIGKILL/`os._exit`）时整个事务回滚，读者仍看到上一完整代，
-  水位停在前一分块；再次 `update` 从持久水位接续，账本保证重放幂等，未处理的
-  后续分块不会被跳过。
+- **原子落定与续跑**：数据按固定分块（默认每块 500 行）提交，每个分块的词位、
+  原文、当前修订、账本条目与该块的连续前缀水位在一个事务里落定。进程在事务
+  提交前被硬退出（验收用父进程真实 SIGKILL）时整个事务回滚，读者仍看到上一
+  完整代，水位停在前一分块；再次 `update` 从持久水位接续，账本保证重放幂等，
+  未处理的后续行不会被跳过。
+
+## 旧进度现场的修复（repair）
+
+旧版本曾按“成果聚合”切块，并把水位推进到该块内各成果的**最大 rowid**；当另一
+成果的行排在该块之后、其所在块尚未提交时，水位会越过未处理行，且账本缺该身份。
+此后 `update` 因 `rowid > 水位` 读不到漏项，正常退出并报告“没有新增输入”。
+
+显式修复命令（一次历史核对，可安全重复执行）：
+
+```bash
+python3 run_search.py repair --db out/harvest.db --index out/search.db \
+    --tenants alpha
+```
+
+- 只在**已消费范围内**（`rowid ≤ 当前水位`）核对：把每条落地行与 `search_ledger`
+  的身份、`source_rowid` 和内容哈希比对，列出缺失/不一致的身份，并把审计范围、
+  回退目标写入 `search_repair` 日志。范围明确：不扫描水位之上的未消费行，也不
+  触碰未选中的机构。
+- 把水位回退到最早漏项之前，再用正常增量逻辑只读未消费行追平；漏项由**仍在的
+  落地资料**重建，不要求删库、不手工改行号、不重建全文索引。其他机构已有的
+  检索内容与水位保持不变。
+- `search_repair_missing` 保存审计出的待追平身份。审计与回退在同一事务内落定，
+  追平过程若被再次终止，再执行 `repair` 会沿用日志和待追平表继续，不会重做
+  历史核对，也不会重复记录。
+- 已完成的租户再次执行 `repair` 直接返回 `already_done`，读 0 行、不新增记录；
+  之后新到的资料仍由普通 `update` 追平（修复期间追加的修订不会被标成已处理）。
+- 修复只处理“漏更新及其残留状态”；`rebuild` 仍保留给库外原地改写等需要整体
+  对账的场合。
 
 ## 命令
 
@@ -541,6 +578,10 @@ python3 run_search.py update --db out/harvest.db --index out/search.db \
 
 # 显式丢弃并整体重建（需要时才全量重扫）
 python3 run_search.py rebuild --db out/harvest.db --index out/search.db
+
+# 修复旧版本写坏的进度：核对已消费范围、找回漏项后增量追平（可重复执行）
+python3 run_search.py repair --db out/harvest.db --index out/search.db \
+    --tenants alpha
 
 # 查询：--tenant 是必填的机构入口；表达式作为一个参数传入
 python3 run_search.py query --index out/search.db --tenant alpha \
@@ -565,8 +606,10 @@ JSON 输出包含 `total/offset/limit/order/results`，每个结果含原文、�
 | 表 | 用途 |
 |---|---|
 | `search_meta` | schema 版本、上次同步时间 |
-| `search_cursor` | 每机构 rowid 水位（读取位置） |
-| `search_ledger` | 已消费身份 `(tenant,accession,revision)` + 内容哈希，识别迟到/改写 |
+| `search_cursor` | 每机构已消费 rowid 的连续前缀末端（真正的读取位置） |
+| `search_ledger` | 已消费身份 `(tenant,accession,revision)` + `source_rowid` + 内容哈希，识别迟到/改写并作为消费证据 |
+| `search_repair` | 旧进度审计日志：审计范围、水位、回退目标、缺失数、状态（每次修复可续跑） |
+| `search_repair_missing` | 审计出的、尚未追平的漏项身份（修复中断后续跑的依据） |
 | `search_docs` | 每 `(tenant,accession)` 当前修订的原文、词数、撤回态、跳过原因 |
 | `search_terms` | 规范化词项词典 |
 | `search_postings` | 词项→文档→字段：词位 positions 与原文半开区间 spans、tf |
@@ -596,10 +639,17 @@ JSON 输出包含 `total/offset/limit/order/results`，每个结果含原文、�
 | S10 | 机构为必填且不串机构；字段限定与否定不带来其他机构文档 |
 | S11 | 一次查询固定单一代快照，并发提交不改变本次 total/排序/摘录 |
 | S12 | 多分块提交时在第二个分块事务内真实硬退出：仅首个分块可见、水位不跳过未处理行；接续后无丢失无重复，水位到达真实最大 rowid |
+| S13 | 500 篇第一版后逐篇追加第二版、再追加 A000 第三版，在第二个写入事务未提交时 SIGKILL：水位停在连续已消费前缀（未越过 A500 的 r2）；`update` 只重读未消费行，A500 换到新版，旧词消失，A000 取第三版；无重复文档，最终水位到达落地最大 rowid |
+| S13b | 同一成果的修订跨多个提交分块：内容与进度一致，最新修订胜出；倒排词数与正文切词独立核对，引擎与朴素解释器一致 |
+| S14 | 用落地库独立推导每篇应有的当前修订与正文，逐篇核对 `search_docs`，不以倒排或引擎输出为真值；再与朴素解释器对照 |
+| S15 | 用冻结的旧版索引器真实写出坏现场（A500 停在 r1、账本缺 r2、普通 `update` 静默 0 行）：`repair` 声明审计范围并找回 A500 r2；无关文档 doc_id/正文不变；日志记满；重复执行 `already_done`、0 行、不新增记录 |
+| S15b | 修复只作用于指定机构：另一机构文档逐字段不变、水位与日志不动、查询答案不变 |
+| S16 | 修复途中第二次分块被真实 SIGKILL：审计与漏项清单持久，续跑完成；修复期间追加的修订不入账本、不被标成已处理，由后续 `update` 读入；完成后水位覆盖追加的最大 rowid；重复修复无新增 |
+| S17 | 操作者恢复流程整体演练：复现症状 → repair → 查询正确 → 后续 update 是干净 no-op，且无需 `rebuild` 或删库 |
 | 边界 | 重复词短语（`"long long"`）不塌缩；标点不占词位、短语可跨标点；空集 total=0 |
 
 ```bash
-python3 tests/search_acceptance.py   # 退出码 0 表示全通过（343 项断言）
+python3 tests/search_acceptance.py   # 退出码 0 表示全通过（434 项断言）
 python3 tests/acceptance.py          # 原采集器验收，保持兼容
 python3 tests/quality_acceptance.py
 python3 tests/crash_consistency_acceptance.py

@@ -726,11 +726,629 @@ def test_multi_chunk_crash():
     fx.close()
 
 
+# --------------------------------------------------------------------------
+# S13 the reported interleave: per-accession grouping vs. commit boundaries
+# --------------------------------------------------------------------------
+def _add_batch(fx, accessions, revision, marker, tenant="alpha"):
+    for accession in accessions:
+        fx.add(accession,
+               {"title": f"paper {accession}",
+                "abstract": f"{marker} abstract {accession}",
+                "publication_year": 2024},
+               tenant=tenant, revision=revision, modified_at=float(revision))
+
+
+def _has(engine, term, accession, tenant="alpha"):
+    r = engine.search(f"abstract:{term}", tenant=tenant, limit=100000)
+    return any(h.accession == accession for h in r.page), r.total
+
+
+def test_interleaved_accessions_across_commit_boundaries():
+    section("S13 interleaved revisions: cursor is a contiguous consumed prefix")
+    fx = Fixture()
+    n = 501
+    names = [f"A{i:03d}" for i in range(n)]
+    _add_batch(fx, names, 1, "oldmarker")
+    fx.sync()
+    # second generation for every accession, then A000's third revision last
+    _add_batch(fx, names, 2, "newmarker")
+    fx.add("A000", {"title": "paper A000 third",
+                    "abstract": "thirdmarker abstract A000",
+                    "publication_year": 2024},
+           revision=3, modified_at=3.0)
+
+    marker = os.path.join(fx.dir, "marker.flag")
+    wait_file = os.path.join(fx.dir, "wait.flag")
+    with open(wait_file, "w", encoding="utf-8"):
+        pass
+    driver = os.path.join(fx.dir, "kill_second_chunk.py")
+    with open(driver, "w", encoding="utf-8") as fh:
+        fh.write(
+            "import os, sys, time\n"
+            f"sys.path.insert(0, {ROOT!r})\n"
+            "from search.indexer import Indexer\n"
+            f"marker = {marker!r}\n"
+            f"wait = {wait_file!r}\n"
+            "calls = {'n': 0}\n"
+            "def barrier(name):\n"
+            "    if name != 'apply_chunk_txn':\n"
+            "        return\n"
+            "    calls['n'] += 1\n"
+            "    if calls['n'] == 2:\n"
+            "        with open(marker, 'w') as fh:\n"
+            "            fh.write('second')\n"
+            "        while True:\n"
+            "            time.sleep(0.01)\n"
+            f"Indexer({fx.index!r}, {fx.landing!r}, crash_barrier=barrier,"
+            " chunk_size=500).sync()\n")
+    proc = subprocess.Popen([sys.executable, driver],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    deadline = time.time() + 60
+    while time.time() < deadline and not os.path.exists(marker):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.01)
+    reached = os.path.exists(marker)
+    if proc.poll() is None:
+        proc.kill()
+    out, _ = proc.communicate(timeout=15)
+    if os.path.exists(wait_file):
+        os.remove(wait_file)
+    check(reached, "subprocess was killed inside the second chunk", out)
+    check(proc.returncode in (137, -9),
+          "hard exit code, not a caught exception", str(proc.returncode))
+
+    # durable progress must stop at the contiguous committed prefix, well
+    # below A500's second-revision rowid, even though A000's revision 3 was
+    # handled by the first chunk.
+    cursor = fx.index_sql("SELECT last_rowid FROM search_cursor"
+                          " WHERE tenant='alpha'")[0]["last_rowid"]
+    a500_r2_rowid = fx.raw_sql(
+        "SELECT rowid AS r FROM result_versions"
+        " WHERE tenant='alpha' AND accession='A500' AND revision=2")[0]["r"]
+    seen, _ = _has(fx.engine(), "newmarker", "A000")
+    check(seen, "rows inside the committed first chunk are visible")
+    row_a000 = fx.index_sql("SELECT revision FROM search_docs"
+                            " WHERE accession='A000'")[0]["revision"]
+    check(row_a000 == 2,
+          "A000 shows the newest revision inside the committed prefix", 
+          str(row_a000))
+    check(cursor < a500_r2_rowid,
+          "cursor did not leap over the uncommitted accession",
+          f"cursor={cursor} < A500 r2 rowid={a500_r2_rowid}")
+    staged = fx.index_sql("SELECT revision FROM search_docs"
+                          " WHERE accession='A500'")[0]["revision"]
+    check(staged == 1, "A500 still shows its first revision", str(staged))
+
+    # a normal update must rescan exactly the un-consumed rows (no full scan)
+    rep = fx.sync()
+    check(rep.scanned < n,
+          "catch-up re-reads only rows above the durable cursor",
+          f"scanned={rep.scanned}")
+    seen, total = _has(fx.engine(), "newmarker", "A500")
+    check(seen, "A500 second revision became searchable after resume")
+    check(total == n - 1,
+          "all second-generation documents except A000 are on newmarker",
+          f"total={total}")
+    seen_old, _ = _has(fx.engine(), "oldmarker", "A500")
+    check(not seen_old, "A500 no longer matches the old marker")
+    seen_third, _ = _has(fx.engine(), "thirdmarker", "A000")
+    check(seen_third, "A000's third revision is current")
+    row = fx.index_sql("SELECT revision, abstract FROM search_docs"
+                       " WHERE accession='A000'")[0]
+    check(row["revision"] == 3 and "thirdmarker" in row["abstract"],
+          "A000 stores exactly its newest revision", str(row))
+    # cursor now equals the landing max: the whole prefix is consumed
+    max_row = fx.raw_sql(
+        "SELECT COALESCE(MAX(rowid),0) m FROM result_versions")[0]["m"]
+    check(fx.index_sql("SELECT last_rowid FROM search_cursor"
+                       " WHERE tenant='alpha'")[0]["last_rowid"] == max_row,
+          "final cursor covers the complete landing prefix")
+    # no duplicate document rows anywhere
+    dup = fx.index_sql(
+        "SELECT COUNT(*) c FROM (SELECT tenant, accession FROM search_docs"
+        " GROUP BY tenant, accession HAVING COUNT(*) > 1)")[0]["c"]
+    check(dup == 0, "no duplicate document rows after resume")
+    fx.close()
+
+
+# --------------------------------------------------------------------------
+# S14 independent expected text for every consumed identity
+# --------------------------------------------------------------------------
+def test_document_text_matches_landing_truth():
+    section("S14 document text derived from landing, not from the index")
+    fx = Fixture()
+    n = 40
+    names = [f"B{i:02d}" for i in range(n)]
+    _add_batch(fx, names, 1, "firstmarker")
+    fx.sync()
+    _add_batch(fx, names, 2, "secondmarker")
+    fx.add("B05", None, revision=3, retracted=True)
+    fx.add("B07", {"title": "B07 late", "abstract": "latearrival text",
+                   "publication_year": 2024}, revision=4, modified_at=0.5)
+    fx.sync()
+    # independent truth: recompute the expected current revision per accession
+    # directly from result_versions, relying on no index table.
+    truth = {}
+    for row in fx.raw_sql(
+            "SELECT accession, revision, retracted, payload FROM"
+            " result_versions WHERE tenant='alpha'"):
+        cur = truth.get(row["accession"])
+        if cur is None or row["revision"] > cur["revision"]:
+            truth[row["accession"]] = row
+    eng = fx.engine()
+    ok_all = True
+    for accession, row in truth.items():
+        docs = fx.index_sql(
+            "SELECT revision, retracted, title, abstract FROM search_docs"
+            " WHERE tenant='alpha' AND accession=?", (accession,))
+        if row["retracted"]:
+            if docs:
+                ok_all = False
+                check(False, f"retracted {accession} must not stay indexed",
+                      str(docs))
+            continue
+        payload = json.loads(row["payload"])
+        expected_title = payload.get("title", "")
+        expected_abs = payload.get("abstract", "")
+        if (len(docs) != 1 or docs[0]["revision"] != row["revision"]
+                or docs[0]["title"] != expected_title
+                or docs[0]["abstract"] != expected_abs):
+            ok_all = False
+            check(False, f"{accession} text/revision matches landing truth",
+                  f"{docs} vs rev {row['revision']}")
+    check(ok_all, "every indexed document matches landing-derived truth")
+    # naive engine cross-check on the new state, not trusting postings
+    docs_naive = _naive_docs(fx)
+    naive = NaiveEngine(docs_naive)
+    for expr in ("abstract:secondmarker", "abstract:latearrival",
+                 "abstract:firstmarker", "title:paper AND abstract:marker"):
+        full = eng.search(expr, tenant="alpha", limit=1000)
+        ref = naive.search(expr, tenant="alpha", limit=0) \
+            if False else naive.search(expr, tenant="alpha")
+        check({h.accession for h in full.page}
+              == {h.doc.accession for h in ref},
+              f"engine matches naive on landing-derived state: {expr!r}")
+    fx.close()
+
+
+# --------------------------------------------------------------------------
+# S15 repair of an index broken by the legacy progress rule
+# --------------------------------------------------------------------------
+def _legacy_index(fx, till_barrier):
+    """Run the frozen pre-fix indexer; optionally kill in chunk 2."""
+    from tests.fixtures import legacy_indexer
+    marker = os.path.join(fx.dir, "legacy.marker")
+    wait_file = os.path.join(fx.dir, "legacy.wait")
+    with open(wait_file, "w", encoding="utf-8"):
+        pass
+    driver = os.path.join(fx.dir, "legacy_driver.py")
+    with open(driver, "w", encoding="utf-8") as fh:
+        fh.write(
+            "import os, sys, time\n"
+            f"sys.path.insert(0, {ROOT!r})\n"
+            "from tests.fixtures import legacy_indexer\n"
+            f"marker = {marker!r}\n"
+            f"wait = {wait_file!r}\n"
+            f"kill = {bool(till_barrier)!r}\n"
+            "calls = {'n': 0}\n"
+            "def barrier(name):\n"
+            "    if name != 'apply_chunk_txn':\n"
+            "        return\n"
+            "    calls['n'] += 1\n"
+            "    if kill and calls['n'] == 2:\n"
+            "        with open(marker, 'w') as fh:\n"
+            "            fh.write('second')\n"
+            "        while True:\n"
+            "            time.sleep(0.01)\n"
+            f"legacy_indexer.Indexer({fx.index!r}, {fx.landing!r},"
+            " crash_barrier=barrier, chunk_size=500).sync()\n")
+    proc = subprocess.Popen([sys.executable, driver],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    if till_barrier:
+        deadline = time.time() + 60
+        while time.time() < deadline and not os.path.exists(marker):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.01)
+        reached = os.path.exists(marker)
+        if proc.poll() is None:
+            proc.kill()
+        out, _ = proc.communicate(timeout=15)
+        if os.path.exists(wait_file):
+            os.remove(wait_file)
+        return reached, out
+    out, _ = proc.communicate(timeout=120)
+    return proc.returncode == 0, out
+
+
+def _build_legacy_broken(fx, count=501):
+    n = count
+    names = [f"A{i:03d}" for i in range(n)]
+    _add_batch(fx, names, 1, "oldmarker")
+    from tests.fixtures import legacy_indexer
+    legacy_indexer.Indexer(fx.index, fx.landing).sync()
+    _add_batch(fx, names, 2, "newmarker")
+    fx.add("A000", {"title": "paper A000 third",
+                    "abstract": "thirdmarker abstract A000",
+                    "publication_year": 2024},
+           revision=3, modified_at=3.0)
+    reached, out = _legacy_index(fx, till_barrier=True)
+    return reached, out, names
+
+
+def test_repair_legacy_broken_index():
+    section("S15 repair a legacy-broken index without rebuild or manual rowids")
+    fx = Fixture()
+    reached, out, names = _build_legacy_broken(fx)
+    check(reached, "legacy indexer was killed in its second chunk", out)
+    # reproduce the reported residue: new marker misses exactly A500
+    eng = fx.engine()
+    seen_new, total_new = _has(eng, "newmarker", "A500")
+    check(not seen_new and total_new == len(names) - 2,
+          "legacy residue: A500 second revision is missing from newmarker",
+          f"total={total_new}")
+    seen_old, _ = _has(eng, "oldmarker", "A500")
+    check(seen_old, "A500 is still searchable by its first revision's term")
+    row = fx.index_sql("SELECT revision FROM search_docs"
+                       " WHERE accession='A500'")[0]
+    check(row["revision"] == 1, "A500 document still holds revision 1")
+    # the a normal update repeats the silent success
+    rep = fx.sync()
+    check(rep.scanned == 0, "plain update has nothing to read (silent gap)",
+          str(rep))
+
+    other_doc = fx.index_sql(
+        "SELECT doc_id, revision, abstract FROM search_docs"
+        " WHERE accession='A001'")[0]
+    # repair: one audit of the consumed range, then catch-up from the gap
+    rep = Indexer(fx.index, fx.landing).repair()
+    tr = rep.tenants[0]
+    check(tr.status == "repaired", "repair reports its work", str(tr))
+    check(tr.audited_from == 0 and tr.audited_to > 0,
+          "audit scope is stated as the consumed rowid range",
+          f"{tr.audited_from}..{tr.audited_to}")
+    check(tr.rewind_to is not None and tr.rewind_to >= 0,
+          "repair states the rewind target", str(tr.rewind_to))
+    check(any(item.accession == "A500" and item.revision == 2
+              for item in tr.missing),
+          "audit identified A500 revision 2 as the missing input",
+          str([(i.accession, i.revision) for i in tr.missing]))
+    seen_new, total_new = _has(fx.engine(), "newmarker", "A500")
+    check(seen_new, "A500 second revision is searchable after repair")
+    check(total_new == len(names) - 1,
+          "all other accessions keep exactly one current document",
+          f"total={total_new}")
+    seen_old, _ = _has(fx.engine(), "oldmarker", "A500")
+    check(not seen_old, "old term vanished with the repaired document")
+    row = fx.index_sql("SELECT revision, abstract FROM search_docs"
+                       " WHERE accession='A500'")[0]
+    check(row["revision"] == 2 and "newmarker" in row["abstract"],
+          "A500 stores exactly its second revision", str(row))
+    # documents unrelated to the gap were not rewritten
+    keep = fx.index_sql(
+        "SELECT doc_id, revision, abstract FROM search_docs"
+        " WHERE accession='A001'")[0]
+    check(keep == other_doc, "other documents keep their doc_id and text",
+          str(keep))
+    # the repair journal is finished and the cursor covers the full prefix
+    jr = fx.index_sql("SELECT * FROM search_repair WHERE tenant='alpha'")[0]
+    check(jr["status"] == "done" and jr["missing_count"] >= 1,
+          "repair journal records audited scope and completion", str(jr))
+    max_row = fx.raw_sql(
+        "SELECT COALESCE(MAX(rowid),0) m FROM result_versions")[0]["m"]
+    check(fx.index_sql("SELECT last_rowid FROM search_cursor"
+                       " WHERE tenant='alpha'")[0]["last_rowid"] == max_row,
+          "cursor covers the whole landing prefix after repair")
+    # idempotent repeat: no new rows, no duplicate documents, same answer
+    before_docs = fx.index_sql("SELECT COUNT(*) c FROM search_docs")[0]["c"]
+    rep2 = Indexer(fx.index, fx.landing).repair()
+    check(rep2.tenants[0].status == "already_done",
+          "a repeated repair performs no second audit", str(rep2.tenants[0]))
+    check(rep2.tenants[0].rows_checked == 0,
+          "repeat repair reads zero rows", str(rep2.tenants[0]))
+    after_docs = fx.index_sql("SELECT COUNT(*) c FROM search_docs")[0]["c"]
+    check(after_docs == before_docs, "repeat repair adds no records",
+          f"{after_docs} vs {before_docs}")
+    check(len(fx.index_sql(
+        "SELECT * FROM search_repair WHERE tenant='alpha'")) == 1,
+        "repeat repair does not append journal rows")
+    seen_new, total_new = _has(fx.engine(), "newmarker", "A500")
+    check(seen_new and total_new == len(names) - 1,
+          "answers stay identical after the repeated repair")
+    fx.close()
+
+
+def test_repair_other_tenant_untouched():
+    section("S15b repair keeps another institution's index intact")
+    fx = Fixture()
+    reached, out, names = _build_legacy_broken(fx)
+    check(reached, "legacy indexer was killed in its second chunk", out)
+    # beta's own healthy index, built by an old run before alpha was broken
+    for i in range(5):
+        fx.add(f"Z{i:02d}", {"title": f"beta {i}",
+                             "abstract": f"betaterm{i} stable",
+                             "publication_year": 2024}, tenant="beta")
+    fx.sync()
+    before = fx.index_sql(
+        "SELECT doc_id, accession, revision, title, abstract FROM search_docs"
+        " WHERE tenant='beta' ORDER BY accession")
+    beta_cursor = fx.index_sql(
+        "SELECT last_rowid FROM search_cursor WHERE tenant='beta'")[0]
+    rep = Indexer(fx.index, fx.landing).repair(tenants=["alpha"])
+    check(rep.tenants[0].tenant == "alpha"
+          and rep.tenants[0].status == "repaired",
+          "scoped repair fixes alpha", str(rep.tenants[0]))
+    after = fx.index_sql(
+        "SELECT doc_id, accession, revision, title, abstract FROM search_docs"
+        " WHERE tenant='beta' ORDER BY accession")
+    check(before == after, "beta documents are byte-identical after repair",
+          f"{before} vs {after}")
+    check(fx.index_sql("SELECT last_rowid FROM search_cursor"
+                       " WHERE tenant='beta'")[0] == beta_cursor,
+          "beta cursor is untouched by an alpha-scoped repair")
+    check(fx.index_sql(
+        "SELECT COUNT(*) c FROM search_repair WHERE tenant='beta'")[0]["c"]
+        == 0, "repair creates no beta journal row")
+    r = SearchEngine(store.connect(fx.index)).search(
+        "betaterm3", tenant="beta")
+    check([h.accession for h in r.page] == ["Z03"],
+          "beta still answers correctly")
+    check(Indexer(fx.index, fx.landing).repair(
+        tenants=["alpha"]).tenants[0].status == "already_done",
+        "a repeated scoped repair is a no-op")
+    fx.close()
+
+
+# --------------------------------------------------------------------------
+# S16 repair interrupted, then new revisions appended mid-repair
+# --------------------------------------------------------------------------
+def test_repair_resume_and_new_rows():
+    section("S16 repair resumes after a hard exit; new rows stay for update")
+    fx = Fixture()
+    # 1001 accessions: the legacy second chunk leaves 501 identities missing,
+    # so the repaired catch-up spans several commit chunks.
+    reached, out, names = _build_legacy_broken(fx, count=1001)
+    check(reached, "legacy indexer was killed in its second chunk", out)
+
+    marker = os.path.join(fx.dir, "repair.marker")
+    wait_file = os.path.join(fx.dir, "repair.wait")
+    with open(wait_file, "w", encoding="utf-8"):
+        pass
+    driver = os.path.join(fx.dir, "repair_driver.py")
+    with open(driver, "w", encoding="utf-8") as fh:
+        fh.write(
+            "import os, sys, time\n"
+            f"sys.path.insert(0, {ROOT!r})\n"
+            "from search.indexer import Indexer\n"
+            f"marker = {marker!r}\n"
+            f"wait = {wait_file!r}\n"
+            "calls = {'n': 0}\n"
+            "def barrier(name):\n"
+            "    if name != 'apply_chunk_txn':\n"
+            "        return\n"
+            "    calls['n'] += 1\n"
+            "    if calls['n'] == 2:\n"
+            "        with open(marker, 'w') as fh:\n"
+            "            fh.write('second')\n"
+            "        while True:\n"
+            "            time.sleep(0.01)\n"
+            f"Indexer({fx.index!r}, {fx.landing!r}, crash_barrier=barrier,"
+            " chunk_size=2).repair()\n")
+    proc = subprocess.Popen([sys.executable, driver],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
+    deadline = time.time() + 60
+    while time.time() < deadline and not os.path.exists(marker):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.01)
+    reached_mid = os.path.exists(marker)
+    if proc.poll() is None:
+        proc.kill()
+    out, _ = proc.communicate(timeout=15)
+    if os.path.exists(wait_file):
+        os.remove(wait_file)
+    check(reached_mid, "repair was hard-exited inside its second chunk", out)
+    jr = fx.index_sql("SELECT status, rewind_to, missing_count FROM"
+                      " search_repair WHERE tenant='alpha'")[0]
+    check(jr["status"] == "audited", "journal survives: audit is durable",
+          str(jr))
+    pending = fx.index_sql(
+        "SELECT COUNT(*) c FROM search_repair_missing")[0]["c"]
+    check(pending >= 1, "missing identities survive the exit", str(pending))
+    # chunk 2 rolled back: the tail is still missing and the cursor stopped
+    # at the first committed repair chunk
+    cursor_mid = fx.index_sql("SELECT last_rowid FROM search_cursor"
+                              " WHERE tenant='alpha'")[0]["last_rowid"]
+    gap_low = fx.raw_sql(
+        "SELECT MIN(rowid) m FROM result_versions"
+        " WHERE tenant='alpha' AND revision=2")[0]["m"]
+    check(gap_low > 1001,
+          "second-generation rows start after the first-generation prefix",
+          str(gap_low))
+    seen_tail, _ = _has(fx.engine(), "newmarker", names[-1])
+    check(not seen_tail and cursor_mid < fx.raw_sql(
+        "SELECT MAX(rowid) m FROM result_versions"
+        " WHERE tenant='alpha' AND revision=2")[0]["m"],
+          "interrupted repair left the tail un-consumed",
+          f"cursor={cursor_mid}")
+
+    # new revisions arrive while a repair is in progress
+    _add_batch(fx, names, 4, "latermarker")
+    new_rowids = fx.raw_sql(
+        "SELECT MIN(rowid) m FROM result_versions WHERE revision=4"
+        " AND tenant='alpha'")[0]["m"]
+    resumed = Indexer(fx.index, fx.landing).repair()
+    tr = resumed.tenants[0]
+    check(tr.status == "repaired", "resumed repair completes", str(tr))
+    seen_new, total_new = _has(fx.engine(), "newmarker", "A500")
+    check(seen_new, "A500 second revision is recovered on resume")
+    # newly appended third generation must NOT be marked consumed by repair
+    cursor = fx.index_sql("SELECT last_rowid FROM search_cursor"
+                          " WHERE tenant='alpha'")[0]["last_rowid"]
+    check(cursor < new_rowids,
+          "repair cursor stops below revisions appended during repair",
+          f"cursor={cursor} < new rows from {new_rowids}")
+    seen_later, _ = _has(fx.engine(), "latermarker", "A001")
+    check(not seen_later, "mid-repair arrivals are not indexed yet")
+    check(fx.index_sql(
+        "SELECT COUNT(*) c FROM search_ledger WHERE revision=4 AND"
+        " tenant='alpha'")[0]["c"] == 0,
+        "mid-repair arrivals are not in the consumption ledger")
+    # the next normal update consumes exactly those new rows
+    rep = fx.sync()
+    check(rep.scanned == len(names),
+          "the later update reads only the newly appended rows",
+          f"scanned={rep.scanned}")
+    seen_later, total_later = _has(fx.engine(), "latermarker", "A001")
+    check(seen_later and total_later == len(names),
+          "newly appended generation becomes current after the explicit"
+          " update", f"total={total_later}")
+    max_row = fx.raw_sql(
+        "SELECT COALESCE(MAX(rowid),0) m FROM result_versions")[0]["m"]
+    check(fx.index_sql("SELECT last_rowid FROM search_cursor"
+                       " WHERE tenant='alpha'")[0]["last_rowid"] == max_row,
+          "cursor finally covers the whole appended prefix")
+    # repair repeated after completion is a no-op
+    rep3 = Indexer(fx.index, fx.landing).repair()
+    check(rep3.tenants[0].status == "already_done"
+          and rep3.tenants[0].rows_checked == 0,
+          "completed repair adds nothing on a repeat", str(rep3.tenants[0]))
+    fx.close()
+
+
+# --------------------------------------------------------------------------
+# S13b one accession spanning chunks: content and progress stay in step
+# --------------------------------------------------------------------------
+def test_same_accession_across_chunks():
+    section("S13b identical accession across commit chunks stays consistent")
+    fx = Fixture()
+    n = 12
+    names = [f"C{i:02d}" for i in range(n)]
+    for name in names:
+        fx.add(name, {"title": f"c {name}", "abstract": "gen1 marker",
+                      "publication_year": 2024}, revision=1)
+    fx.sync()
+    # revision 2 of C00..C04, revision 3 of C01 and C04, then revision 2 of
+    # C05..C11: with chunk_size 3 the revisions of C04 span two chunks.
+    for name in names[:5]:
+        fx.add(name, {"title": f"c {name}", "abstract": "gen2 marker",
+                      "publication_year": 2024}, revision=2)
+    for name in ("C01", "C04"):
+        fx.add(name, {"title": f"c {name}", "abstract": "gen3 marker",
+                      "publication_year": 2024}, revision=3)
+    for name in names[5:]:
+        fx.add(name, {"title": f"c {name}", "abstract": "gen2 marker",
+                      "publication_year": 2024}, revision=2)
+    rep = Indexer(fx.index, fx.landing, chunk_size=3).sync()
+    check(rep.documents_upserted > 0, "chunked run applied revisions", str(rep))
+    eng = fx.engine()
+    r3 = eng.search("abstract:gen3", tenant="alpha", limit=100)
+    check({h.accession for h in r3.page} == {"C01", "C04"} and r3.total == 2,
+          "newest revision wins within an accession spanning chunks",
+          str([(h.accession, h.revision) for h in r3.page]))
+    r2 = eng.search("abstract:gen2", tenant="alpha", limit=100)
+    check({h.accession for h in r2.page}
+          == {n for n in names if n not in ("C01", "C04")},
+          "older revisions of the split accession are gone",
+          str(sorted(h.accession for h in r2.page)))
+    r1 = eng.search("abstract:gen1", tenant="alpha", limit=100)
+    check(r1.total == 0, "no stale first-generation text remains")
+    # independent truth check: postings must match the stored document text
+    for row in fx.index_sql(
+            "SELECT doc_id, title, abstract, title_tokens, abs_tokens"
+            " FROM search_docs"):
+        doc = fx.index_sql(
+            "SELECT field, SUM(tf) s FROM search_postings"
+            " WHERE doc_id=?", (row["doc_id"],)) if False else None
+        ok = True
+        for field_name, text, count_col in (
+                ("title", row["title"], row["title_tokens"]),
+                ("abstract", row["abstract"], row["abs_tokens"])):
+            ntok = len(tokenize(text))
+            if ntok != count_col:
+                ok = False
+            rows = fx.index_sql(
+                "SELECT positions, tf FROM search_postings p JOIN search_terms"
+                " t ON t.term_id=p.term_id WHERE p.doc_id=? AND p.field=?",
+                (row["doc_id"], field_name))
+            if sum(r["tf"] for r in rows) != count_col:
+                ok = False
+        check(ok, f"postings and token counts agree with text {row['doc_id']}",
+              str(row))
+    # and the engine agrees with the naive interpreter on this state
+    naive = NaiveEngine(_naive_docs(fx))
+    for expr in ("abstract:gen3", "abstract:gen2", "title:c"):
+        full = eng.search(expr, tenant="alpha", limit=1000)
+        ref = naive.search(expr, tenant="alpha")
+        check({h.accession for h in full.page}
+              == {h.doc.accession for h in ref},
+              f"engine matches naive across chunks: {expr!r}")
+    # cursor is the landing max after the run
+    max_row = fx.raw_sql(
+        "SELECT COALESCE(MAX(rowid),0) m FROM result_versions")[0]["m"]
+    check(fx.index_sql("SELECT last_rowid FROM search_cursor"
+                       " WHERE tenant='alpha'")[0]["last_rowid"] == max_row,
+          "chunked cursor reaches the landing max")
+    fx.close()
+
+
+# --------------------------------------------------------------------------
+# S17 the full operator recovery flow over the reported scene
+# --------------------------------------------------------------------------
+def test_operator_recovery_flow():
+    section("S17 operator recovery: reproduce, repair, verify reproducible")
+    fx = Fixture()
+    reached, out, names = _build_legacy_broken(fx)
+    check(reached, "legacy indexer was killed in its second chunk", out)
+    eng = fx.engine()
+    seen, _ = _has(eng, "newmarker", "A500")
+    check(not seen, "reported symptom reproduced: A500 missing from newmarker")
+    # status reports the repaired journal state before and after
+    status_before = fx.index_sql(
+        "SELECT COUNT(*) c FROM search_repair")[0]["c"]
+    check(status_before == 0, "a legacy index has no repair journal yet")
+    tr = Indexer(fx.index, fx.landing).repair().tenants[0]
+    check(tr.status == "repaired" and tr.missing,
+          "repair names the recovered identities", str(tr))
+    check(tr.audited_from == 0 and tr.audited_to > 0,
+          "audit scope covers the consumed prefix", str(tr))
+    row = fx.index_sql("SELECT * FROM search_repair"
+                       " WHERE tenant='alpha'")[0]
+    check(row["status"] == "done" and row["missing_count"] == 1,
+          "journal shows one recovered input and completion", str(row))
+    check(fx.index_sql(
+        "SELECT COUNT(*) c FROM search_repair_missing")[0]["c"] == 1,
+        "outstanding-gap table keeps the audited identity for audit")
+    seen, total = _has(fx.engine(), "newmarker", "A500")
+    check(seen and total == len(names) - 1,
+          "recovered index answers the query correctly")
+    # a normal update afterwards reads nothing and adds no records
+    rep = fx.sync()
+    check(rep.scanned == 0 and rep.new_identities == 0,
+          "after repair update is a clean no-op", str(rep))
+    # rebuild remains available but is not what recovered the scene: the
+    # journal is evidence that repair did it, no rebuild was needed.
+    check(fx.index_sql("SELECT COUNT(*) c FROM search_docs")[0]["c"]
+          == len(names), "one document per accession, no duplicates")
+    fx.close()
+
+
 def main():
     tests = [test_parser, test_tokenizer_offsets, test_engine_and_naive,
              test_incremental, test_crash_consistency,
              test_tenant_isolation, test_snapshot_consistency,
-             test_multi_chunk_crash]
+             test_multi_chunk_crash,
+             test_interleaved_accessions_across_commit_boundaries,
+             test_same_accession_across_chunks,
+             test_document_text_matches_landing_truth,
+             test_repair_legacy_broken_index,
+             test_repair_other_tenant_untouched,
+             test_repair_resume_and_new_rows,
+             test_operator_recovery_flow]
     for t in tests:
         t()
     print("\n" + "=" * 60)

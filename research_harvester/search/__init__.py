@@ -19,6 +19,6 @@ naive      a brute-force reference interpreter used by the acceptance suite to
 """
 
 FIELDS = ("title", "abstract")
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 __all__ = ["FIELDS", "SCHEMA_VERSION"]

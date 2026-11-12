@@ -7,10 +7,17 @@ only when the explicit index/update command runs.
 Tables (all prefixed ``search_``)
 ---------------------------------
 search_meta        key/value metadata incl. schema version
-search_cursor      per-tenant landing rowid watermark (resume position)
+search_cursor      per-tenant durable progress: the largest *contiguous
+                   consumed prefix* of landing rowids (not the max rowid a
+                   chunk happened to touch)
 search_ledger      every consumed landing identity with a content hash, so
                    late rows / smaller revisions / rowid gaps are detected
                    like the quality layer's input ledger
+search_repair      one journal row per tenant for an explicit audit of legacy
+                   progress (scope, rewind target, status)
+search_repair_missing
+                   identities the audit found absent/mismatched but whose
+                   catch-up is still outstanding; drives resumable repair
 search_docs        one row per (tenant, accession): the CURRENT revision's
                    original title/abstract, retraction flag, skip reasons
 search_terms       dictionary of normalized term strings
@@ -22,10 +29,11 @@ search_skips       audit rows for non-text / non-object fields (with reasons,
 Atomicity
 ---------
 Each sync chunk commits in one transaction containing postings, document text,
-current revision and the advanced watermark together.  A hard exit leaves the
-previous complete state intact; the watermark only moves inside the same
-transaction as the index changes.  Query readers take a snapshot transaction so
-total, ordering and excerpts always come from one consistent view.
+current revision, ledger entries and the advanced contiguous-prefix cursor
+together.  A hard exit leaves the previous complete state intact; the cursor
+only moves inside the same transaction as the index changes, and never past a
+row that this transaction did not consume.  Query readers take a snapshot
+transaction so total, ordering and excerpts always come from one view.
 """
 from __future__ import annotations
 
@@ -62,6 +70,25 @@ CREATE TABLE IF NOT EXISTS search_cursor (
   tenant      TEXT PRIMARY KEY,
   last_rowid  INTEGER NOT NULL DEFAULT 0,
   updated_at  REAL
+);
+CREATE TABLE IF NOT EXISTS search_repair (
+  tenant         TEXT NOT NULL,
+  audit_from     INTEGER NOT NULL,
+  audit_to       INTEGER NOT NULL,
+  cursor_before  INTEGER NOT NULL,
+  rewind_to      INTEGER,
+  missing_count  INTEGER NOT NULL DEFAULT 0,
+  status         TEXT NOT NULL,             -- audited | done
+  noted_at       REAL NOT NULL,
+  updated_at     REAL NOT NULL,
+  PRIMARY KEY (tenant)
+);
+CREATE TABLE IF NOT EXISTS search_repair_missing (
+  tenant       TEXT NOT NULL,
+  accession    TEXT NOT NULL,
+  revision     INTEGER NOT NULL,
+  source_rowid INTEGER NOT NULL,
+  PRIMARY KEY (tenant, accession, revision)
 );
 CREATE TABLE IF NOT EXISTS search_ledger (
   tenant       TEXT NOT NULL,
